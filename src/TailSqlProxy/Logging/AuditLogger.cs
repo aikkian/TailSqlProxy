@@ -20,23 +20,27 @@ public class AuditLogger : IAuditLogger, IDisposable
             .WriteTo.File(
                 path: logPath,
                 rollingInterval: RollingInterval.Day,
-                outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} [{Level:u3}] {Message:lj}{NewLine}")
-            .CreateLogger();
+                outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fffZ} [{Level:u3}] {Message:lj}{NewLine}")
+            .Enrich.WithProperty("_dummy", 0)
+            .CreateLogger()
+            .ForContext(Serilog.Core.Constants.SourceContextPropertyName, "Audit");
     }
 
     public void LogQuery(QueryContext context)
     {
         _auditLog.Information(
-            "QUERY | IP={ClientIp} | User={Username} | DB={Database} | App={AppName} | SQL={SqlText}",
-            context.ClientIp, context.Username, context.Database, context.AppName,
+            "QUERY | Time={UtcDateTime} | IP={ClientIp} | Host={HostName} | User={Username} | DB={Database} | App={AppName} | SQL={SqlText}",
+            DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff"),
+            context.ClientIp, context.HostName, context.Username, context.Database, context.AppName,
             Truncate(context.SqlText));
     }
 
     public void LogBlocked(QueryContext context, string reason)
     {
         _auditLog.Warning(
-            "BLOCKED | IP={ClientIp} | User={Username} | DB={Database} | App={AppName} | Reason={Reason} | SQL={SqlText}",
-            context.ClientIp, context.Username, context.Database, context.AppName,
+            "BLOCKED | Time={UtcDateTime} | IP={ClientIp} | Host={HostName} | User={Username} | DB={Database} | App={AppName} | Reason={Reason} | SQL={SqlText}",
+            DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff"),
+            context.ClientIp, context.HostName, context.Username, context.Database, context.AppName,
             reason, Truncate(context.SqlText));
     }
 

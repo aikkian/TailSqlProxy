@@ -29,6 +29,7 @@ public class ClientSession : IDisposable
 
     // Session state
     private string? _clientIp;
+    private string? _hostName;
     private string? _username;
     private string? _database;
     private string? _appName;
@@ -129,6 +130,7 @@ public class ClientSession : IDisposable
             _username = login.ExtractUsername();
             _database = login.ExtractDatabase();
             _appName = login.ExtractAppName();
+            _hostName = login.ExtractHostName();
 
             var (major, minor, build) = login.ExtractTdsVersion();
             _logger.LogInformation(
@@ -226,6 +228,7 @@ public class ClientSession : IDisposable
         {
             SqlText = sqlText,
             ClientIp = _clientIp,
+            HostName = _hostName,
             Username = _username,
             Database = _database,
             AppName = _appName,
@@ -257,6 +260,7 @@ public class ClientSession : IDisposable
             ProcedureName = procName,
             IsRpc = true,
             ClientIp = _clientIp,
+            HostName = _hostName,
             Username = _username,
             Database = _database,
             AppName = _appName,

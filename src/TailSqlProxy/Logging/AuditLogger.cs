@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Options;
 using Serilog;
 using Serilog.Events;
+using Serilog.Sinks.Datadog.Logs;
 using TailSqlProxy.Configuration;
 using TailSqlProxy.Rules;
 using ILogger = Serilog.ILogger;
@@ -14,14 +15,33 @@ public class AuditLogger : IAuditLogger, IDisposable
 
     public AuditLogger(IOptions<ProxyOptions> options)
     {
-        var logPath = options.Value.AuditLogPath ?? "logs/audit-.log";
-        _auditLog = new LoggerConfiguration()
+        var proxyOptions = options.Value;
+        var logPath = proxyOptions.AuditLogPath ?? "logs/audit-.log";
+
+        var loggerConfig = new LoggerConfiguration()
             .MinimumLevel.Information()
             .WriteTo.File(
                 path: logPath,
                 rollingInterval: RollingInterval.Day,
-                outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fffZ} [{Level:u3}] {Message:lj}{NewLine}")
-            .Enrich.WithProperty("_dummy", 0)
+                outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fffZ} [{Level:u3}] {Message:lj}{NewLine}");
+
+        var dd = proxyOptions.Datadog;
+        if (dd.Enabled && !string.IsNullOrWhiteSpace(dd.ApiKey))
+        {
+            var ddConfig = new DatadogConfiguration();
+            loggerConfig = loggerConfig
+                .WriteTo.DatadogLogs(
+                    apiKey: dd.ApiKey,
+                    source: dd.Source,
+                    service: dd.Service,
+                    host: dd.Host ?? Environment.MachineName,
+                    tags: dd.Tags ?? [],
+                    configuration: ddConfig)
+                .Enrich.WithProperty("dd.service", dd.Service)
+                .Enrich.WithProperty("dd.source", dd.Source);
+        }
+
+        _auditLog = loggerConfig
             .CreateLogger()
             .ForContext(Serilog.Core.Constants.SourceContextPropertyName, "Audit");
     }

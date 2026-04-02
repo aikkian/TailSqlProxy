@@ -121,21 +121,66 @@ public class ClientSession : IDisposable
         if (loginMessage == null)
             throw new InvalidOperationException("Client disconnected during Login7.");
 
+        bool expectFedAuth = false;
+
         if (loginMessage.Type == TdsPacketType.Login7)
         {
             var login = new Login7Message(loginMessage);
             _username = login.ExtractUsername();
             _database = login.ExtractDatabase();
             _appName = login.ExtractAppName();
-            _logger.LogInformation("Login7: User={Username}, DB={Database}, App={AppName}", _username, _database, _appName);
+
+            var (major, minor, build) = login.ExtractTdsVersion();
+            _logger.LogInformation(
+                "Login7: User={Username}, DB={Database}, App={AppName}, TDS={Major}.{Minor}.{Build}",
+                _username, _database, _appName, major, minor, build);
+
+            // TDS 7.4+ (reported as "TDS 8.0") clients may negotiate feature extensions
+            if (login.HasFeatureExtension())
+            {
+                var features = login.GetRequestedFeatures();
+                _logger.LogDebug("Login7 FeatureExt: {Features}",
+                    string.Join(", ", features));
+
+                expectFedAuth = login.RequestsFedAuth();
+                if (expectFedAuth)
+                    _logger.LogDebug("Client requests FedAuth (Azure AD/Entra ID authentication)");
+            }
         }
 
         // Forward Login7 to server
         await ForwardToServerRawAsync(loginMessage, ct);
 
-        // Forward server's login response to client
-        // The server may send multiple response messages (LOGINACK, ENVCHANGE, etc.)
+        // Forward server's login response to client.
+        // For SQL Auth, this contains LOGINACK + ENVCHANGE + DONE (login complete).
+        // For FedAuth (Entra ID), this contains FEDAUTHINFO token prompting
+        // the client to obtain a token from the STS endpoint.
         await ForwardServerResponseToClientAsync(ct);
+
+        if (expectFedAuth)
+        {
+            // TDS 8.0 FedAuth flow: Login7 → FEDAUTHINFO → FedAuthToken → LOGINACK.
+            // The client now sends a FederatedAuthToken (0x08) packet with the bearer token.
+            var fedAuthMessage = await _clientReader!.ReadMessageAsync(ct);
+            if (fedAuthMessage == null)
+                throw new InvalidOperationException("Client disconnected during FedAuth token exchange.");
+
+            if (fedAuthMessage.Type == TdsPacketType.FederatedAuthToken)
+            {
+                _logger.LogDebug("Relaying FederatedAuthToken to server (Entra ID auth)");
+                await ForwardToServerRawAsync(fedAuthMessage, ct);
+
+                // Server validates the token and responds with final LOGINACK + ENVCHANGE + DONE
+                await ForwardServerResponseToClientAsync(ct);
+            }
+            else
+            {
+                // Unexpected — forward and let server handle it
+                _logger.LogWarning("Expected FederatedAuthToken but got {Type}", fedAuthMessage.Type);
+                await ForwardToServerRawAsync(fedAuthMessage, ct);
+                await ForwardServerResponseToClientAsync(ct);
+            }
+        }
     }
 
     private async Task MessageLoopAsync(CancellationToken ct)

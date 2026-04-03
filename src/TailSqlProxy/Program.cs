@@ -53,6 +53,7 @@ builder.Services.AddSingleton<TdsProxyServer>();
 builder.Services.AddScoped<ClientSession>();
 
 // Rules
+builder.Services.AddSingleton<IQueryRule, SqlInjectionRule>();
 builder.Services.AddSingleton<IQueryRule, UnboundedSelectRule>();
 builder.Services.AddSingleton<IQueryRule, UnboundedDeleteRule>();
 builder.Services.AddSingleton<IQueryRule, SsmsMetadataRule>();

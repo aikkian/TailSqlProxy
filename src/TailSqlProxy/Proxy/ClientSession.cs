@@ -14,6 +14,7 @@ namespace TailSqlProxy.Proxy;
 public class ClientSession : IDisposable
 {
     private readonly TargetServerOptions _targetOptions;
+    private readonly ProxyOptions _proxyOptions;
     private readonly TlsBridge _tlsBridge;
     private readonly IRuleEngine _ruleEngine;
     private readonly IAuditLogger _auditLogger;
@@ -27,6 +28,10 @@ public class ClientSession : IDisposable
     private TdsMessageReader? _serverReader;
     private TdsMessageWriter? _serverWriter;
 
+    // Write locks to prevent interleaved packet writes from concurrent tasks
+    private readonly SemaphoreSlim _clientWriteLock = new(1, 1);
+    private readonly SemaphoreSlim _serverWriteLock = new(1, 1);
+
     // Session state
     private string? _clientIp;
     private string? _hostName;
@@ -34,14 +39,19 @@ public class ClientSession : IDisposable
     private string? _database;
     private string? _appName;
 
+    // Timeout for response forwarding (prevents hung connections)
+    private static readonly TimeSpan ResponseTimeout = TimeSpan.FromMinutes(5);
+
     public ClientSession(
         IOptions<TargetServerOptions> targetOptions,
+        IOptions<ProxyOptions> proxyOptions,
         TlsBridge tlsBridge,
         IRuleEngine ruleEngine,
         IAuditLogger auditLogger,
         ILogger<ClientSession> logger)
     {
         _targetOptions = targetOptions.Value;
+        _proxyOptions = proxyOptions.Value;
         _tlsBridge = tlsBridge;
         _ruleEngine = ruleEngine;
         _auditLogger = auditLogger;
@@ -83,8 +93,8 @@ public class ClientSession : IDisposable
 
             _auditLogger.LogConnection(_clientIp, _username, _database, _appName);
 
-            // 6. Main message loop
-            await MessageLoopAsync(ct);
+            // 6. Bidirectional relay — two concurrent tasks for MARS support
+            await RunBidirectionalRelayAsync(ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -97,23 +107,218 @@ public class ClientSession : IDisposable
         }
     }
 
+    /// <summary>
+    /// Runs two concurrent tasks:
+    ///   1. Client→Server: reads client messages, inspects/blocks, forwards allowed ones to server
+    ///   2. Server→Client: reads server packets and forwards them to client transparently
+    /// When either side disconnects or errors, both tasks are cancelled.
+    /// This supports MARS (Multiple Active Result Sets) where the client can send
+    /// new queries while previous responses are still streaming back.
+    /// </summary>
+    private async Task RunBidirectionalRelayAsync(CancellationToken ct)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+
+        var clientToServerTask = RelayClientToServerAsync(cts.Token);
+        var serverToClientTask = RelayServerToClientAsync(cts.Token);
+
+        // Wait for either task to complete (disconnect or error)
+        var completedTask = await Task.WhenAny(clientToServerTask, serverToClientTask);
+
+        // Cancel the other direction
+        await cts.CancelAsync();
+
+        // Await both to observe exceptions
+        try { await clientToServerTask; } catch (OperationCanceledException) { }
+        try { await serverToClientTask; } catch (OperationCanceledException) { }
+
+        // Propagate any non-cancellation exception from the first completed task
+        if (completedTask.IsFaulted)
+            await completedTask; // rethrows
+    }
+
+    /// <summary>
+    /// Client→Server relay: reads TDS messages from client, inspects SQL Batch and RPC
+    /// messages through the rule engine, blocks or forwards to server.
+    /// </summary>
+    private async Task RelayClientToServerAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            var message = await _clientReader!.ReadMessageAsync(ct);
+            if (message == null)
+            {
+                _logger.LogDebug("Client disconnected");
+                break;
+            }
+
+            switch (message.Type)
+            {
+                case TdsPacketType.SqlBatch:
+                    await HandleSqlBatchAsync(message, ct);
+                    break;
+
+                case TdsPacketType.Rpc:
+                    await HandleRpcAsync(message, ct);
+                    break;
+
+                default:
+                    // Attention, TransactionManagerRequest, etc. — forward transparently
+                    await WriteToServerAsync(message, ct);
+                    break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Server→Client relay: reads raw TDS packets from server and forwards to client.
+    /// Runs independently of the client→server direction.
+    /// All server responses (result sets, errors, DONE tokens) flow through here.
+    /// </summary>
+    private async Task RelayServerToClientAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            var packet = await _serverReader!.ReadPacketAsync(ct);
+            if (packet == null)
+            {
+                _logger.LogDebug("Server disconnected");
+                break;
+            }
+
+            await WriteToClientRawAsync(packet.RawBytes, ct);
+        }
+    }
+
+    private async Task HandleSqlBatchAsync(TdsMessage message, CancellationToken ct)
+    {
+        var batch = new SqlBatchMessage(message);
+        var sqlText = batch.GetSqlText();
+
+        var context = BuildQueryContext(sqlText);
+        var result = _ruleEngine.Evaluate(context);
+
+        if (result.IsBlocked)
+        {
+            _auditLogger.LogBlocked(context, result.Reason!);
+            await SendBlockedResponseAsync($"Query blocked by TailSqlProxy: {result.Reason}", ct);
+            return;
+        }
+
+        _auditLogger.LogQuery(context);
+        await WriteToServerAsync(message, ct);
+    }
+
+    private async Task HandleRpcAsync(TdsMessage message, CancellationToken ct)
+    {
+        var rpc = new RpcRequestMessage(message);
+        var procName = rpc.GetProcedureName();
+        var sqlText = rpc.GetSqlTextFromSpExecuteSql() ?? $"EXEC {procName}";
+
+        var context = BuildQueryContext(sqlText, procName, isRpc: true);
+        var result = _ruleEngine.Evaluate(context);
+
+        if (result.IsBlocked)
+        {
+            _auditLogger.LogBlocked(context, result.Reason!);
+            await SendBlockedResponseAsync($"Query blocked by TailSqlProxy: {result.Reason}", ct);
+            return;
+        }
+
+        _auditLogger.LogQuery(context);
+        await WriteToServerAsync(message, ct);
+    }
+
+    private QueryContext BuildQueryContext(string sqlText, string? procName = null, bool isRpc = false)
+    {
+        return new QueryContext
+        {
+            SqlText = sqlText,
+            ProcedureName = procName,
+            IsRpc = isRpc,
+            ClientIp = _clientIp,
+            HostName = _hostName,
+            Username = _username,
+            Database = _database,
+            AppName = _appName,
+        };
+    }
+
+    private async Task SendBlockedResponseAsync(string message, CancellationToken ct)
+    {
+        var errorPayload = TdsResponseBuilder.BuildErrorResponse(
+            errorNumber: 50000,
+            state: 1,
+            severity: 16,
+            message: message,
+            serverName: "TailSqlProxy");
+
+        await WriteToClientAsync(TdsPacketType.TabularResult, errorPayload, ct);
+    }
+
+    // --- Thread-safe write methods using locks ---
+
+    private async Task WriteToServerAsync(TdsMessage message, CancellationToken ct)
+    {
+        await _serverWriteLock.WaitAsync(ct);
+        try
+        {
+            foreach (var packet in message.Packets)
+            {
+                await _serverWriter!.WriteRawAsync(packet.RawBytes, ct);
+            }
+        }
+        finally
+        {
+            _serverWriteLock.Release();
+        }
+    }
+
+    private async Task WriteToClientRawAsync(ReadOnlyMemory<byte> data, CancellationToken ct)
+    {
+        await _clientWriteLock.WaitAsync(ct);
+        try
+        {
+            await _clientWriter!.WriteRawAsync(data, ct);
+        }
+        finally
+        {
+            _clientWriteLock.Release();
+        }
+    }
+
+    private async Task WriteToClientAsync(TdsPacketType type, ReadOnlyMemory<byte> payload, CancellationToken ct)
+    {
+        await _clientWriteLock.WaitAsync(ct);
+        try
+        {
+            await _clientWriter!.WriteMessageAsync(type, payload, ct);
+        }
+        finally
+        {
+            _clientWriteLock.Release();
+        }
+    }
+
+    // --- PreLogin and Login7 (sequential, before bidirectional relay) ---
+
     private async Task ForwardPreLoginAsync(CancellationToken ct)
     {
-        // Forward client's PreLogin to server
         var clientPreLogin = await _clientReader!.ReadMessageAsync(ct);
         if (clientPreLogin == null)
             throw new InvalidOperationException("Client disconnected during PreLogin.");
 
         _logger.LogDebug("Received PreLogin from client, forwarding to server");
-        await ForwardToServerRawAsync(clientPreLogin, ct);
+        foreach (var packet in clientPreLogin.Packets)
+            await _serverWriter!.WriteRawAsync(packet.RawBytes, ct);
 
-        // Forward server's PreLogin response to client
         var serverPreLogin = await _serverReader!.ReadMessageAsync(ct);
         if (serverPreLogin == null)
             throw new InvalidOperationException("Server disconnected during PreLogin.");
 
         _logger.LogDebug("Received PreLogin response from server, forwarding to client");
-        await ForwardToClientRawAsync(serverPreLogin, ct);
+        foreach (var packet in serverPreLogin.Packets)
+            await _clientWriter!.WriteRawAsync(packet.RawBytes, ct);
     }
 
     private async Task HandleLogin7Async(CancellationToken ct)
@@ -137,7 +342,6 @@ public class ClientSession : IDisposable
                 "Login7: User={Username}, DB={Database}, App={AppName}, TDS={Major}.{Minor}.{Build}",
                 _username, _database, _appName, major, minor, build);
 
-            // TDS 7.4+ (reported as "TDS 8.0") clients may negotiate feature extensions
             if (login.HasFeatureExtension())
             {
                 var features = login.GetRequestedFeatures();
@@ -151,18 +355,14 @@ public class ClientSession : IDisposable
         }
 
         // Forward Login7 to server
-        await ForwardToServerRawAsync(loginMessage, ct);
+        foreach (var packet in loginMessage.Packets)
+            await _serverWriter!.WriteRawAsync(packet.RawBytes, ct);
 
-        // Forward server's login response to client.
-        // For SQL Auth, this contains LOGINACK + ENVCHANGE + DONE (login complete).
-        // For FedAuth (Entra ID), this contains FEDAUTHINFO token prompting
-        // the client to obtain a token from the STS endpoint.
+        // Forward server's login response to client
         await ForwardServerResponseToClientAsync(ct);
 
         if (expectFedAuth)
         {
-            // TDS 8.0 FedAuth flow: Login7 → FEDAUTHINFO → FedAuthToken → LOGINACK.
-            // The client now sends a FederatedAuthToken (0x08) packet with the bearer token.
             var fedAuthMessage = await _clientReader!.ReadMessageAsync(ct);
             if (fedAuthMessage == null)
                 throw new InvalidOperationException("Client disconnected during FedAuth token exchange.");
@@ -170,158 +370,39 @@ public class ClientSession : IDisposable
             if (fedAuthMessage.Type == TdsPacketType.FederatedAuthToken)
             {
                 _logger.LogDebug("Relaying FederatedAuthToken to server (Entra ID auth)");
-                await ForwardToServerRawAsync(fedAuthMessage, ct);
-
-                // Server validates the token and responds with final LOGINACK + ENVCHANGE + DONE
+                foreach (var packet in fedAuthMessage.Packets)
+                    await _serverWriter!.WriteRawAsync(packet.RawBytes, ct);
                 await ForwardServerResponseToClientAsync(ct);
             }
             else
             {
-                // Unexpected — forward and let server handle it
                 _logger.LogWarning("Expected FederatedAuthToken but got {Type}", fedAuthMessage.Type);
-                await ForwardToServerRawAsync(fedAuthMessage, ct);
+                foreach (var packet in fedAuthMessage.Packets)
+                    await _serverWriter!.WriteRawAsync(packet.RawBytes, ct);
                 await ForwardServerResponseToClientAsync(ct);
             }
         }
     }
 
-    private async Task MessageLoopAsync(CancellationToken ct)
-    {
-        while (!ct.IsCancellationRequested)
-        {
-            var message = await _clientReader!.ReadMessageAsync(ct);
-            if (message == null)
-            {
-                _logger.LogDebug("Client disconnected");
-                break;
-            }
-
-            switch (message.Type)
-            {
-                case TdsPacketType.SqlBatch:
-                    await HandleSqlBatchAsync(message, ct);
-                    break;
-
-                case TdsPacketType.Rpc:
-                    await HandleRpcAsync(message, ct);
-                    break;
-
-                case TdsPacketType.Attention:
-                    await ForwardToServerRawAsync(message, ct);
-                    await ForwardServerResponseToClientAsync(ct);
-                    break;
-
-                default:
-                    await ForwardToServerRawAsync(message, ct);
-                    await ForwardServerResponseToClientAsync(ct);
-                    break;
-            }
-        }
-    }
-
-    private async Task HandleSqlBatchAsync(TdsMessage message, CancellationToken ct)
-    {
-        var batch = new SqlBatchMessage(message);
-        var sqlText = batch.GetSqlText();
-
-        var context = new QueryContext
-        {
-            SqlText = sqlText,
-            ClientIp = _clientIp,
-            HostName = _hostName,
-            Username = _username,
-            Database = _database,
-            AppName = _appName,
-        };
-
-        var result = _ruleEngine.Evaluate(context);
-
-        if (result.IsBlocked)
-        {
-            _auditLogger.LogBlocked(context, result.Reason!);
-            await SendBlockedResponseAsync($"Query blocked by TailSqlProxy: {result.Reason}", ct);
-            return;
-        }
-
-        _auditLogger.LogQuery(context);
-        await ForwardToServerRawAsync(message, ct);
-        await ForwardServerResponseToClientAsync(ct);
-    }
-
-    private async Task HandleRpcAsync(TdsMessage message, CancellationToken ct)
-    {
-        var rpc = new RpcRequestMessage(message);
-        var procName = rpc.GetProcedureName();
-        var sqlText = rpc.GetSqlTextFromSpExecuteSql() ?? $"EXEC {procName}";
-
-        var context = new QueryContext
-        {
-            SqlText = sqlText,
-            ProcedureName = procName,
-            IsRpc = true,
-            ClientIp = _clientIp,
-            HostName = _hostName,
-            Username = _username,
-            Database = _database,
-            AppName = _appName,
-        };
-
-        var result = _ruleEngine.Evaluate(context);
-
-        if (result.IsBlocked)
-        {
-            _auditLogger.LogBlocked(context, result.Reason!);
-            await SendBlockedResponseAsync($"Query blocked by TailSqlProxy: {result.Reason}", ct);
-            return;
-        }
-
-        _auditLogger.LogQuery(context);
-        await ForwardToServerRawAsync(message, ct);
-        await ForwardServerResponseToClientAsync(ct);
-    }
-
-    private async Task SendBlockedResponseAsync(string message, CancellationToken ct)
-    {
-        var errorPayload = TdsResponseBuilder.BuildErrorResponse(
-            errorNumber: 50000,
-            state: 1,
-            severity: 16,
-            message: message,
-            serverName: "TailSqlProxy");
-
-        await _clientWriter!.WriteMessageAsync(TdsPacketType.TabularResult, errorPayload, ct);
-    }
-
-    private async Task ForwardToServerRawAsync(TdsMessage message, CancellationToken ct)
-    {
-        foreach (var packet in message.Packets)
-        {
-            await _serverWriter!.WriteRawAsync(packet.RawBytes, ct);
-        }
-    }
-
-    private async Task ForwardToClientRawAsync(TdsMessage message, CancellationToken ct)
-    {
-        foreach (var packet in message.Packets)
-        {
-            await _clientWriter!.WriteRawAsync(packet.RawBytes, ct);
-        }
-    }
-
+    /// <summary>
+    /// Sequential response forwarding used only during login handshake (before bidirectional relay).
+    /// Includes a timeout to prevent hung connections.
+    /// </summary>
     private async Task ForwardServerResponseToClientAsync(CancellationToken ct)
     {
-        // Read packets from server and forward to client.
-        // Response ends when we detect a final DONE/DONEPROC token (without DONE_MORE bit).
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(ResponseTimeout);
+
         while (true)
         {
-            var packet = await _serverReader!.ReadPacketAsync(ct);
+            var packet = await _serverReader!.ReadPacketAsync(timeoutCts.Token);
             if (packet == null)
             {
                 _logger.LogWarning("Server disconnected during response forwarding");
                 break;
             }
 
-            await _clientWriter!.WriteRawAsync(packet.RawBytes, ct);
+            await _clientWriter!.WriteRawAsync(packet.RawBytes, timeoutCts.Token);
 
             if (packet.Header.IsEndOfMessage && packet.Header.Type == TdsPacketType.TabularResult)
             {
@@ -334,25 +415,19 @@ public class ClientSession : IDisposable
     /// <summary>
     /// Checks if the packet payload ends with a DONE or DONEPROC token
     /// that does not have the DONE_MORE (0x0001) status bit set.
-    /// DONE token: 0xFD (12 bytes: token(1) + status(2) + curcmd(2) + rowcount(8) = 13 total)
-    /// DONEPROC token: 0xFE (same structure)
     /// </summary>
     private static bool ContainsFinalDoneToken(byte[] payload)
     {
-        // DONE/DONEPROC/DONEINPROC tokens are 13 bytes each (1 + 2 + 2 + 8)
         const int doneTokenSize = 13;
 
         if (payload.Length < doneTokenSize)
             return false;
 
-        // Check last potential token
         int offset = payload.Length - doneTokenSize;
         byte tokenType = payload[offset];
 
         if (tokenType is not (0xFD or 0xFE))
         {
-            // Try checking at different offsets in case there are trailing bytes
-            // or multiple DONE tokens
             for (int i = payload.Length - doneTokenSize; i >= 0; i--)
             {
                 if (payload[i] is 0xFD or 0xFE)
@@ -371,13 +446,13 @@ public class ClientSession : IDisposable
             return false;
 
         ushort status = BinaryPrimitives.ReadUInt16LittleEndian(payload.AsSpan(offset + 1, 2));
-
-        // DONE_MORE = 0x0001: if NOT set, this is the final response
         return (status & 0x0001) == 0;
     }
 
     public void Dispose()
     {
+        _clientWriteLock.Dispose();
+        _serverWriteLock.Dispose();
         _clientStream?.Dispose();
         _serverStream?.Dispose();
         _serverConnection?.Dispose();

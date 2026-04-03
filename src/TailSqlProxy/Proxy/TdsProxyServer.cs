@@ -42,8 +42,11 @@ public class TdsProxyServer
                 var clientEndpoint = client.Client.RemoteEndPoint as IPEndPoint;
                 _logger.LogInformation("New connection from {ClientIp}", clientEndpoint?.Address);
 
-                if (Interlocked.CompareExchange(ref _activeConnections, 0, 0) >= _options.MaxConcurrentConnections)
+                // Atomic increment-and-check: increment first, then rollback if over limit
+                var count = Interlocked.Increment(ref _activeConnections);
+                if (count > _options.MaxConcurrentConnections)
                 {
+                    Interlocked.Decrement(ref _activeConnections);
                     _logger.LogWarning("Max concurrent connections ({Max}) reached. Rejecting connection from {ClientIp}",
                         _options.MaxConcurrentConnections, clientEndpoint?.Address);
                     client.Close();
@@ -65,7 +68,7 @@ public class TdsProxyServer
 
     private async Task HandleClientAsync(TcpClient client, CancellationToken ct)
     {
-        Interlocked.Increment(ref _activeConnections);
+        // Connection already counted via Interlocked.Increment in StartAsync
         try
         {
             using var scope = _serviceProvider.CreateScope();

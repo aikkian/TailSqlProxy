@@ -8,41 +8,33 @@ namespace TailSqlProxy.Proxy;
 
 public class CertificateProvider
 {
-    private readonly ProxyOptions _options;
-    private readonly ILogger<CertificateProvider> _logger;
-    private X509Certificate2? _certificate;
+    private readonly Lazy<X509Certificate2> _certificate;
 
     public CertificateProvider(IOptions<ProxyOptions> options, ILogger<CertificateProvider> logger)
     {
-        _options = options.Value;
-        _logger = logger;
-    }
-
-    public X509Certificate2 GetCertificate()
-    {
-        if (_certificate != null)
-            return _certificate;
-
-        var certOptions = _options.Certificate;
-
-        if (!string.IsNullOrWhiteSpace(certOptions.Path))
+        var proxyOptions = options.Value;
+        _certificate = new Lazy<X509Certificate2>(() =>
         {
-            _logger.LogInformation("Loading certificate from {Path}", certOptions.Path);
-            _certificate = new X509Certificate2(certOptions.Path, certOptions.Password);
-        }
-        else if (certOptions.AutoGenerate)
-        {
-            _logger.LogInformation("Auto-generating self-signed certificate for TDS proxy");
-            _certificate = GenerateSelfSignedCertificate();
-        }
-        else
-        {
+            var certOptions = proxyOptions.Certificate;
+
+            if (!string.IsNullOrWhiteSpace(certOptions.Path))
+            {
+                logger.LogInformation("Loading certificate from {Path}", certOptions.Path);
+                return new X509Certificate2(certOptions.Path, certOptions.Password);
+            }
+
+            if (certOptions.AutoGenerate)
+            {
+                logger.LogInformation("Auto-generating self-signed certificate for TDS proxy");
+                return GenerateSelfSignedCertificate();
+            }
+
             throw new InvalidOperationException(
                 "No certificate configured. Set Certificate.Path or Certificate.AutoGenerate=true in appsettings.json.");
-        }
-
-        return _certificate;
+        }, LazyThreadSafetyMode.ExecutionAndPublication);
     }
+
+    public X509Certificate2 GetCertificate() => _certificate.Value;
 
     private X509Certificate2 GenerateSelfSignedCertificate()
     {

@@ -5,6 +5,7 @@ public class RuleOptions
     public UnboundedSelectOptions? UnboundedSelect { get; set; }
     public UnboundedDeleteOptions? UnboundedDelete { get; set; }
     public SsmsMetadataOptions? SsmsMetadata { get; set; }
+    public SqlInjectionOptions? SqlInjection { get; set; }
 
     /// <summary>
     /// Users in this list bypass all query blocking rules.
@@ -35,6 +36,24 @@ public class UnboundedSelectOptions
 public class UnboundedDeleteOptions
 {
     public bool Enabled { get; set; } = true;
+}
+
+public class SqlInjectionOptions
+{
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>
+    /// When true, SQL with parse errors AND suspicious characteristics is blocked.
+    /// Legitimate application SQL rarely has parse errors; injected payloads often do.
+    /// Default: false (conservative — only block on definitive patterns).
+    /// </summary>
+    public bool BlockOnParseErrors { get; set; }
+
+    /// <summary>
+    /// Additional regex patterns to detect custom injection signatures.
+    /// These are checked alongside the built-in patterns.
+    /// </summary>
+    public string[]? CustomPatterns { get; set; }
 }
 
 public class SsmsMetadataOptions

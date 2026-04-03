@@ -1,20 +1,36 @@
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using TailSqlProxy.Configuration;
 
 namespace TailSqlProxy.Rules;
 
 public class RuleEngine : IRuleEngine
 {
     private readonly IReadOnlyList<IQueryRule> _rules;
+    private readonly RuleOptions _options;
     private readonly ILogger<RuleEngine> _logger;
 
-    public RuleEngine(IEnumerable<IQueryRule> rules, ILogger<RuleEngine> logger)
+    private readonly HashSet<string> _bypassUsers;
+    private readonly HashSet<string> _bypassAppNames;
+    private readonly HashSet<string> _bypassClientIps;
+
+    public RuleEngine(IEnumerable<IQueryRule> rules, IOptions<RuleOptions> options, ILogger<RuleEngine> logger)
     {
         _rules = rules.ToList();
+        _options = options.Value;
         _logger = logger;
+
+        _bypassUsers = new HashSet<string>(_options.BypassUsers, StringComparer.OrdinalIgnoreCase);
+        _bypassAppNames = new HashSet<string>(_options.BypassAppNames, StringComparer.OrdinalIgnoreCase);
+        _bypassClientIps = new HashSet<string>(_options.BypassClientIps, StringComparer.Ordinal);
     }
 
     public RuleResult Evaluate(QueryContext context)
     {
+        // Check if this session is allowed to bypass all rules
+        if (IsBypassed(context))
+            return RuleResult.Allow;
+
         foreach (var rule in _rules)
         {
             if (!rule.IsEnabled)
@@ -30,5 +46,28 @@ public class RuleEngine : IRuleEngine
         }
 
         return RuleResult.Allow;
+    }
+
+    private bool IsBypassed(QueryContext context)
+    {
+        if (context.Username is not null && _bypassUsers.Contains(context.Username))
+        {
+            _logger.LogDebug("User {Username} bypasses rule evaluation (in BypassUsers list)", context.Username);
+            return true;
+        }
+
+        if (context.AppName is not null && _bypassAppNames.Contains(context.AppName))
+        {
+            _logger.LogDebug("App {AppName} bypasses rule evaluation (in BypassAppNames list)", context.AppName);
+            return true;
+        }
+
+        if (context.ClientIp is not null && _bypassClientIps.Contains(context.ClientIp))
+        {
+            _logger.LogDebug("Client IP {ClientIp} bypasses rule evaluation (in BypassClientIps list)", context.ClientIp);
+            return true;
+        }
+
+        return false;
     }
 }

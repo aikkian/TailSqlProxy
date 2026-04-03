@@ -20,7 +20,7 @@ public class CertificateProvider
             if (!string.IsNullOrWhiteSpace(certOptions.Path))
             {
                 logger.LogInformation("Loading certificate from {Path}", certOptions.Path);
-                return new X509Certificate2(certOptions.Path, certOptions.Password);
+                return X509CertificateLoader.LoadPkcs12FromFile(certOptions.Path, certOptions.Password);
             }
 
             if (certOptions.AutoGenerate)
@@ -63,6 +63,6 @@ public class CertificateProvider
 
         // On Linux, export and re-import to ensure the private key is accessible
         var exported = cert.Export(X509ContentType.Pfx, "");
-        return new X509Certificate2(exported, "", X509KeyStorageFlags.MachineKeySet | X509KeyStorageFlags.Exportable);
+        return X509CertificateLoader.LoadPkcs12(exported, "", X509KeyStorageFlags.MachineKeySet | X509KeyStorageFlags.Exportable);
     }
 }

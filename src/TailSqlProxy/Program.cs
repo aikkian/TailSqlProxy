@@ -11,6 +11,9 @@ using TailSqlProxy.Rules;
 
 var builder = Host.CreateApplicationBuilder(args);
 
+// Set minimum thread pool size for high-concurrency on Linux
+ThreadPool.SetMinThreads(200, 200);
+
 // Serilog for application logging
 builder.Services.AddSerilog(config =>
 {

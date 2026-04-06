@@ -56,21 +56,17 @@ public class TlsBridge
     }
 
     /// <summary>
-    /// Establishes TLS for TDS 7.x (traditional SQL Server).
-    /// In TDS 7.x, TLS handshake bytes are wrapped inside TDS PreLogin packets.
-    /// After the handshake, only the Login7 and subsequent payloads are encrypted,
-    /// while the TDS packet headers remain in cleartext.
+    /// Establishes TLS with a TDS 7.x server.
+    /// TLS handshake bytes are wrapped inside TDS PreLogin packets.
+    /// After handshake, switches to passthrough for direct TLS record flow.
+    /// Must be called AFTER the PreLogin exchange has completed on the raw stream.
     /// </summary>
-    public async Task<(SslStream ClientSsl, SslStream ServerSsl)> EstablishTds7TlsAsync(
-        Stream clientRawStream,
+    public async Task<SslStream> EstablishServerTds7TlsAsync(
         Stream serverRawStream,
         string targetServerHostname,
         CancellationToken ct)
     {
-        var proxyCert = _certificateProvider.GetCertificate();
-
-        // For TDS 7.x, we use wrapper streams that strip/add TDS headers
-        // around the TLS handshake bytes
+        _logger.LogDebug("Initiating TDS 7.x TLS handshake with server: {Host}", targetServerHostname);
         var serverWrapper = new TdsPreLoginWrapperStream(serverRawStream);
         var serverSsl = new SslStream(serverWrapper, leaveInnerStreamOpen: true, ValidateServerCertificate);
 
@@ -81,6 +77,48 @@ public class TlsBridge
             RemoteCertificateValidationCallback = ValidateServerCertificate,
         }, ct);
 
+        serverWrapper.EnablePassthrough();
+        _logger.LogDebug("TLS established with TDS 7.x server (Protocol: {Protocol})", serverSsl.SslProtocol);
+
+        return serverSsl;
+    }
+
+    /// <summary>
+    /// Accepts raw TLS from a TDS 8.0 client (no TDS wrapping — pure TLS from first byte).
+    /// </summary>
+    public async Task<SslStream> AcceptClientTlsAsync(
+        Stream clientRawStream,
+        CancellationToken ct)
+    {
+        var proxyCert = _certificateProvider.GetCertificate();
+
+        _logger.LogDebug("Accepting raw TLS from TDS 8.0 client");
+        var clientSsl = new SslStream(clientRawStream, leaveInnerStreamOpen: false);
+
+        await clientSsl.AuthenticateAsServerAsync(new SslServerAuthenticationOptions
+        {
+            ServerCertificate = proxyCert,
+            ClientCertificateRequired = false,
+            EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+        }, ct);
+        _logger.LogDebug("TLS established with TDS 8.0 client (Protocol: {Protocol})", clientSsl.SslProtocol);
+
+        return clientSsl;
+    }
+
+    /// <summary>
+    /// Establishes TLS with a TDS 7.x client.
+    /// TLS handshake bytes are wrapped inside TDS PreLogin packets (type 0x12).
+    /// After the handshake completes, the wrapper switches to passthrough mode
+    /// so subsequent TLS records flow directly over the raw stream.
+    /// </summary>
+    public async Task<SslStream> EstablishClientTds7TlsAsync(
+        Stream clientRawStream,
+        CancellationToken ct)
+    {
+        var proxyCert = _certificateProvider.GetCertificate();
+
+        _logger.LogDebug("Accepting TDS 7.x TLS handshake from client (wrapped in PreLogin packets)");
         var clientWrapper = new TdsPreLoginWrapperStream(clientRawStream);
         var clientSsl = new SslStream(clientWrapper, leaveInnerStreamOpen: true);
 
@@ -91,7 +129,12 @@ public class TlsBridge
             EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
         }, ct);
 
-        return (clientSsl, serverSsl);
+        // Switch wrapper to passthrough — after TLS handshake, TLS records
+        // flow directly on the wire without TDS PreLogin wrapping
+        clientWrapper.EnablePassthrough();
+        _logger.LogDebug("TLS established with TDS 7.x client (Protocol: {Protocol})", clientSsl.SslProtocol);
+
+        return clientSsl;
     }
 
     private static bool ValidateServerCertificate(
@@ -115,11 +158,18 @@ internal class TdsPreLoginWrapperStream : Stream
     private readonly Stream _inner;
     private readonly MemoryStream _readBuffer = new();
     private bool _readBufferConsumed = true;
+    private volatile bool _passthrough;
 
     public TdsPreLoginWrapperStream(Stream inner)
     {
         _inner = inner;
     }
+
+    /// <summary>
+    /// Switches to passthrough mode — after the TLS handshake completes,
+    /// TLS records flow directly without TDS PreLogin wrapping.
+    /// </summary>
+    public void EnablePassthrough() => _passthrough = true;
 
     public override bool CanRead => true;
     public override bool CanSeek => false;
@@ -133,6 +183,9 @@ internal class TdsPreLoginWrapperStream : Stream
 
     public override int Read(byte[] buffer, int offset, int count)
     {
+        if (_passthrough)
+            return _inner.Read(buffer, offset, count);
+
         if (_readBufferConsumed || _readBuffer.Position >= _readBuffer.Length)
         {
             // Read next TDS packet from inner stream
@@ -166,6 +219,13 @@ internal class TdsPreLoginWrapperStream : Stream
 
     public override void Write(byte[] buffer, int offset, int count)
     {
+        if (_passthrough)
+        {
+            _inner.Write(buffer, offset, count);
+            _inner.Flush();
+            return;
+        }
+
         // Wrap in TDS PreLogin packet
         int packetLen = count + 8;
         var packet = new byte[packetLen];
@@ -179,7 +239,37 @@ internal class TdsPreLoginWrapperStream : Stream
         _inner.Flush();
     }
 
+    public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken ct)
+    {
+        if (_passthrough)
+            return _inner.ReadAsync(buffer, offset, count, ct);
+        return base.ReadAsync(buffer, offset, count, ct);
+    }
+
+    public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
+    {
+        if (_passthrough)
+            return _inner.ReadAsync(buffer, ct);
+        return base.ReadAsync(buffer, ct);
+    }
+
+    public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken ct)
+    {
+        if (_passthrough)
+            return _inner.WriteAsync(buffer, offset, count, ct);
+        return base.WriteAsync(buffer, offset, count, ct);
+    }
+
+    public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
+    {
+        if (_passthrough)
+            return _inner.WriteAsync(buffer, ct);
+        return base.WriteAsync(buffer, ct);
+    }
+
     public override void Flush() => _inner.Flush();
+
+    public override Task FlushAsync(CancellationToken ct) => _inner.FlushAsync(ct);
 
     public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
     public override void SetLength(long value) => throw new NotSupportedException();

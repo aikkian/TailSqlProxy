@@ -65,36 +65,106 @@ public class ClientSession : IDisposable
 
         try
         {
-            // 1. Connect to target Azure SQL
+            // Peek at first byte to detect TDS version without consuming it
+            var peekBuf = new byte[1];
+            int peekRead = client.Client.Receive(peekBuf, 0, 1, System.Net.Sockets.SocketFlags.Peek);
+            if (peekRead == 0) return;
+
+            bool isTds8 = peekBuf[0] == 0x16; // TLS ClientHello
+
+            // 1. Connect to target server
             _serverConnection = new TcpClient();
+            _serverConnection.NoDelay = true;
             await _serverConnection.ConnectAsync(_targetOptions.Host, _targetOptions.Port, ct);
             _logger.LogDebug("Connected to target server {Host}:{Port}", _targetOptions.Host, _targetOptions.Port);
 
-            // 2. Establish TLS on both sides (TDS 8.0 mode for Azure SQL)
-            var (clientSsl, serverSsl) = await _tlsBridge.EstablishTds8TlsAsync(
-                client.GetStream(),
-                _serverConnection.GetStream(),
-                _targetOptions.Host,
-                ct);
+            var clientNetStream = client.GetStream();
+            var serverNetStream = _serverConnection.GetStream();
 
-            _clientStream = clientSsl;
-            _serverStream = serverSsl;
+            if (isTds8)
+            {
+                // TDS 8.0 client + TDS 7.x server bridging
+                _logger.LogDebug("Detected TDS 8.0 client (TLS from first byte)");
 
-            // 3. Create readers/writers
-            _clientReader = new TdsMessageReader(_clientStream);
-            _clientWriter = new TdsMessageWriter(_clientStream);
-            _serverReader = new TdsMessageReader(_serverStream);
-            _serverWriter = new TdsMessageWriter(_serverStream);
+                // Generate a PreLogin for the server (TDS 7.x requires PreLogin before TLS)
+                var proxyPreLogin = BuildPreLoginPacket();
+                await serverNetStream.WriteAsync(proxyPreLogin, ct);
+                await serverNetStream.FlushAsync(ct);
 
-            // 4. Handle PreLogin exchange
-            await ForwardPreLoginAsync(ct);
+                // Read server's PreLogin response (raw TCP)
+                var rawServerReader = new TdsMessageReader(serverNetStream);
+                var serverPreLoginMsg = await rawServerReader.ReadMessageAsync(ct);
+                if (serverPreLoginMsg == null)
+                    throw new InvalidOperationException("Server disconnected during PreLogin.");
+                _logger.LogDebug("Server PreLogin response received");
 
-            // 5. Handle Login7 (extract user/db info, then forward)
+                // TLS with server (TDS 7.x — wrapped in PreLogin packets)
+                var serverSsl = await _tlsBridge.EstablishServerTds7TlsAsync(
+                    serverNetStream, _targetOptions.Host, ct);
+                _serverStream = serverSsl;
+
+                // TLS with client (TDS 8.0 — raw TLS)
+                var clientSsl = await _tlsBridge.AcceptClientTlsAsync(clientNetStream, ct);
+                _clientStream = clientSsl;
+
+                _clientReader = new TdsMessageReader(_clientStream);
+                _clientWriter = new TdsMessageWriter(_clientStream);
+                _serverReader = new TdsMessageReader(_serverStream);
+                _serverWriter = new TdsMessageWriter(_serverStream);
+
+                // Forward PreLogin exchange over TLS (client expects PreLogin over TLS in TDS 8.0)
+                await ForwardPreLoginAsync(ct);
+            }
+            else
+            {
+                // TDS 7.x client + TDS 7.x server (JDBC, DataGrip)
+                _logger.LogDebug("Detected TDS 7.x client (PreLogin first)");
+
+                // Read client's PreLogin (raw TCP)
+                var rawClientReader = new TdsMessageReader(clientNetStream);
+                var clientPreLogin = await rawClientReader.ReadMessageAsync(ct);
+                if (clientPreLogin == null)
+                    throw new InvalidOperationException("Client disconnected during PreLogin.");
+                _logger.LogDebug("Received TDS 7.x PreLogin from client ({Len} bytes)", clientPreLogin.Payload.Length);
+
+                // Forward PreLogin to server (raw TCP)
+                foreach (var pkt in clientPreLogin.Packets)
+                    await serverNetStream.WriteAsync(pkt.RawBytes, ct);
+                await serverNetStream.FlushAsync(ct);
+
+                // Read server's PreLogin response (raw TCP)
+                var rawServerReader = new TdsMessageReader(serverNetStream);
+                var serverPreLogin = await rawServerReader.ReadMessageAsync(ct);
+                if (serverPreLogin == null)
+                    throw new InvalidOperationException("Server disconnected during PreLogin.");
+
+                // Forward PreLogin response to client (raw TCP)
+                foreach (var pkt in serverPreLogin.Packets)
+                    await clientNetStream.WriteAsync(pkt.RawBytes, ct);
+                await clientNetStream.FlushAsync(ct);
+                _logger.LogDebug("PreLogin exchange complete");
+
+                // TLS with server (TDS 7.x — wrapped in PreLogin packets)
+                var serverSsl = await _tlsBridge.EstablishServerTds7TlsAsync(
+                    serverNetStream, _targetOptions.Host, ct);
+                _serverStream = serverSsl;
+
+                // TLS with client (TDS 7.x — wrapped in PreLogin packets)
+                var clientSsl = await _tlsBridge.EstablishClientTds7TlsAsync(clientNetStream, ct);
+                _clientStream = clientSsl;
+
+                _clientReader = new TdsMessageReader(_clientStream);
+                _clientWriter = new TdsMessageWriter(_clientStream);
+                _serverReader = new TdsMessageReader(_serverStream);
+                _serverWriter = new TdsMessageWriter(_serverStream);
+            }
+
+            // Handle Login7 (extract user/db info, then forward)
             await HandleLogin7Async(ct);
 
             _auditLogger.LogConnection(_clientIp, _username, _database, _appName, _sessionId);
 
-            // 6. Bidirectional relay — two concurrent tasks for MARS support
+            // Bidirectional relay — two concurrent tasks for MARS support
             await RunBidirectionalRelayAsync(ct);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -106,6 +176,49 @@ public class ClientSession : IDisposable
             _auditLogger.LogDisconnection(_clientIp, _username, _sessionId);
             _logger.LogInformation("Client {ClientIp} disconnected (User={Username})", _clientIp, _username);
         }
+    }
+
+    /// <summary>
+    /// Builds a minimal TDS PreLogin packet for the proxy to send to TDS 7.x servers.
+    /// Requests ENCRYPT_ON so the server agrees to TLS after PreLogin.
+    /// </summary>
+    private static byte[] BuildPreLoginPacket()
+    {
+        // PreLogin option tokens
+        // VERSION: offset 0x15, length 6
+        // ENCRYPTION: offset 0x1B, length 1
+        // TERMINATOR: 0xFF
+        var options = new byte[]
+        {
+            0x00, 0x00, 0x15, 0x00, 0x06, // VERSION token
+            0x01, 0x00, 0x1B, 0x00, 0x01, // ENCRYPTION token
+            0xFF,                           // TERMINATOR
+        };
+
+        var optionData = new byte[]
+        {
+            // Version: 16.0.0.0 (TDS 7.4)
+            0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // Encryption: ENCRYPT_ON (0x01)
+            0x01,
+        };
+
+        int payloadLen = options.Length + optionData.Length;
+        int packetLen = 8 + payloadLen;
+        var packet = new byte[packetLen];
+
+        // TDS header
+        packet[0] = 0x12; // PreLogin
+        packet[1] = 0x01; // EOM
+        packet[2] = (byte)(packetLen >> 8);
+        packet[3] = (byte)(packetLen & 0xFF);
+        // SPID=0, PacketID=1, Window=0
+        packet[6] = 0x01;
+
+        Array.Copy(options, 0, packet, 8, options.Length);
+        Array.Copy(optionData, 0, packet, 8 + options.Length, optionData.Length);
+
+        return packet;
     }
 
     /// <summary>
@@ -228,6 +341,102 @@ public class ClientSession : IDisposable
 
         _auditLogger.LogQuery(context);
         await WriteToServerAsync(message, ct);
+    }
+
+    /// <summary>
+    /// Rewrites the ServerName field in a Login7 message so Azure SQL accepts the connection.
+    /// Clients connecting through the proxy send "localhost" as the server name, but Azure SQL
+    /// requires its own hostname in the Login7 packet.
+    /// </summary>
+    private TdsMessage RewriteLogin7ServerName(TdsMessage loginMessage, string newServerName)
+    {
+        var payload = loginMessage.Payload;
+        if (payload.Length < 56)
+            return loginMessage;
+
+        // Read ServerName pointer: offset at byte 52 (LE ushort), char length at byte 54 (LE ushort)
+        ushort serverOffset = BinaryPrimitives.ReadUInt16LittleEndian(payload.AsSpan(52));
+        ushort serverCharLen = BinaryPrimitives.ReadUInt16LittleEndian(payload.AsSpan(54));
+
+        int oldByteLen = serverCharLen * 2;
+        byte[] newServerBytes = System.Text.Encoding.Unicode.GetBytes(newServerName);
+        int newByteLen = newServerBytes.Length;
+        int delta = newByteLen - oldByteLen;
+
+        if (delta == 0 && serverCharLen > 0)
+        {
+            // Same length — just overwrite in place
+            Array.Copy(newServerBytes, 0, payload, serverOffset, newByteLen);
+            return RebuildLogin7Message(payload);
+        }
+
+        // Build new payload with adjusted size
+        var newPayload = new byte[payload.Length + delta];
+
+        // Copy everything before the server name data
+        Array.Copy(payload, 0, newPayload, 0, serverOffset);
+        // Insert new server name
+        Array.Copy(newServerBytes, 0, newPayload, serverOffset, newByteLen);
+        // Copy everything after the old server name data
+        int afterOld = serverOffset + oldByteLen;
+        Array.Copy(payload, afterOld, newPayload, serverOffset + newByteLen, payload.Length - afterOld);
+
+        // Update ServerName char length
+        BinaryPrimitives.WriteUInt16LittleEndian(newPayload.AsSpan(54), (ushort)newServerName.Length);
+
+        // Update total Login7 length at bytes 0-3
+        uint totalLen = BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(0));
+        BinaryPrimitives.WriteUInt32LittleEndian(newPayload.AsSpan(0), (uint)(totalLen + delta));
+
+        // Adjust all string/extension pointer offsets that point past the old server name position
+        // Login7 pointer fields: each has a 2-byte LE offset at these positions
+        int[] pointerOffsets = [36, 40, 44, 48, 52, 56, 60, 64, 68, 78, 82, 86];
+        foreach (int ptrOff in pointerOffsets)
+        {
+            if (ptrOff + 2 > newPayload.Length) break;
+            ushort dataOff = BinaryPrimitives.ReadUInt16LittleEndian(newPayload.AsSpan(ptrOff));
+            if (dataOff > serverOffset)
+                BinaryPrimitives.WriteUInt16LittleEndian(newPayload.AsSpan(ptrOff), (ushort)(dataOff + delta));
+        }
+
+        // Adjust the nested FeatureExt pointer inside the extension data area.
+        // ibExtension (offset 56) points to extension data in the variable area.
+        // The first 4 bytes at that location are a DWORD offset to the FeatureExt block.
+        if (newPayload.Length > 58)
+        {
+            ushort ibExt = BinaryPrimitives.ReadUInt16LittleEndian(newPayload.AsSpan(56));
+            if (ibExt > 0 && ibExt + 4 <= newPayload.Length)
+            {
+                uint featureExtOff = BinaryPrimitives.ReadUInt32LittleEndian(newPayload.AsSpan(ibExt));
+                if (featureExtOff > (uint)serverOffset && featureExtOff < (uint)newPayload.Length)
+                {
+                    BinaryPrimitives.WriteUInt32LittleEndian(newPayload.AsSpan(ibExt),
+                        (uint)(featureExtOff + delta));
+                }
+            }
+        }
+
+        _logger.LogDebug("Rewrote Login7 ServerName from {OldLen} chars to '{NewServer}' ({Delta:+#;-#;0} bytes)",
+            serverCharLen, newServerName, delta);
+
+        return RebuildLogin7Message(newPayload);
+    }
+
+    private static TdsMessage RebuildLogin7Message(byte[] payload)
+    {
+        var packetLen = (ushort)(TdsPacketHeader.Size + payload.Length);
+        var raw = new byte[packetLen];
+        var header = new TdsPacketHeader(
+            type: TdsPacketType.Login7,
+            status: (byte)TdsStatusBits.EndOfMessage,
+            length: packetLen,
+            spid: 0,
+            packetId: 1,
+            window: 0);
+        header.WriteTo(raw);
+        Array.Copy(payload, 0, raw, TdsPacketHeader.Size, payload.Length);
+        var packet = new TdsPacket(header, payload, raw);
+        return new TdsMessage(TdsPacketType.Login7, payload, new[] { packet });
     }
 
     private QueryContext BuildQueryContext(string sqlText, string? procName = null, bool isRpc = false)
@@ -356,6 +565,10 @@ public class ClientSession : IDisposable
                     _logger.LogDebug("Client requests FedAuth (Azure AD/Entra ID authentication)");
             }
         }
+
+        // Rewrite server name in Login7 to match the target server
+        // (clients send "localhost" when connecting to the proxy, but Azure SQL requires its real hostname)
+        loginMessage = RewriteLogin7ServerName(loginMessage, _targetOptions.Host);
 
         // Forward Login7 to server
         foreach (var packet in loginMessage.Packets)

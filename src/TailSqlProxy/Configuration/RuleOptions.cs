@@ -6,6 +6,7 @@ public class RuleOptions
     public UnboundedDeleteOptions? UnboundedDelete { get; set; }
     public SsmsMetadataOptions? SsmsMetadata { get; set; }
     public SqlInjectionOptions? SqlInjection { get; set; }
+    public AccessControlOptions? AccessControl { get; set; }
 
     /// <summary>
     /// Users in this list bypass all query blocking rules.
@@ -63,4 +64,67 @@ public class SsmsMetadataOptions
     public string[]? BlockedSystemViews { get; set; }
     public string[]? BlockedSchemas { get; set; }
     public string[]? AllowedPatterns { get; set; }
+}
+
+public class AccessControlOptions
+{
+    public bool Enabled { get; set; }
+    public AccessControlPolicy[]? Policies { get; set; }
+}
+
+/// <summary>
+/// An access control policy defining who can do what on which objects.
+/// Policies are evaluated in priority order (highest first).
+/// </summary>
+public class AccessControlPolicy
+{
+    /// <summary>Policy name for audit log display.</summary>
+    public string? Name { get; set; }
+
+    /// <summary>Higher priority policies are evaluated first.</summary>
+    public int Priority { get; set; }
+
+    /// <summary>Deny or Allow this access.</summary>
+    public PolicyAction Action { get; set; } = PolicyAction.Deny;
+
+    // --- Subject (WHO) ---
+
+    /// <summary>Users this policy applies to. Null = all users.</summary>
+    public string[]? Users { get; set; }
+
+    /// <summary>App names this policy applies to. Null = all apps.</summary>
+    public string[]? AppNames { get; set; }
+
+    /// <summary>Client IPs this policy applies to. Null = all IPs.</summary>
+    public string[]? ClientIps { get; set; }
+
+    // --- Object (WHAT) ---
+
+    /// <summary>Database name. Null = all databases.</summary>
+    public string? Database { get; set; }
+
+    /// <summary>Regex pattern for table/view names (e.g. "^dbo\\.Salary$", ".*_sensitive").</summary>
+    public string? ObjectPattern { get; set; }
+
+    /// <summary>Specific columns. Null = all columns on matched objects.</summary>
+    public string[]? Columns { get; set; }
+
+    // --- Operation (HOW) ---
+
+    /// <summary>SQL operations this policy applies to. Null = all operations.</summary>
+    public SqlOperation[]? Operations { get; set; }
+}
+
+public enum PolicyAction
+{
+    Deny,
+    Allow,
+}
+
+public enum SqlOperation
+{
+    Select,
+    Insert,
+    Update,
+    Delete,
 }

@@ -33,6 +33,7 @@ public class ClientSession : IDisposable
     private readonly SemaphoreSlim _serverWriteLock = new(1, 1);
 
     // Session state
+    private readonly string _sessionId = Guid.NewGuid().ToString("N")[..12];
     private string? _clientIp;
     private string? _hostName;
     private string? _username;
@@ -91,7 +92,7 @@ public class ClientSession : IDisposable
             // 5. Handle Login7 (extract user/db info, then forward)
             await HandleLogin7Async(ct);
 
-            _auditLogger.LogConnection(_clientIp, _username, _database, _appName);
+            _auditLogger.LogConnection(_clientIp, _username, _database, _appName, _sessionId);
 
             // 6. Bidirectional relay — two concurrent tasks for MARS support
             await RunBidirectionalRelayAsync(ct);
@@ -102,7 +103,7 @@ public class ClientSession : IDisposable
         }
         finally
         {
-            _auditLogger.LogDisconnection(_clientIp, _username);
+            _auditLogger.LogDisconnection(_clientIp, _username, _sessionId);
             _logger.LogInformation("Client {ClientIp} disconnected (User={Username})", _clientIp, _username);
         }
     }
@@ -241,6 +242,8 @@ public class ClientSession : IDisposable
             Username = _username,
             Database = _database,
             AppName = _appName,
+            SessionId = _sessionId,
+            StartTimeUtc = DateTime.UtcNow,
         };
     }
 

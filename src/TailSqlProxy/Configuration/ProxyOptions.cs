@@ -7,6 +7,8 @@ public class ProxyOptions
     public int MaxConcurrentConnections { get; set; } = 100;
     public CertificateOptions Certificate { get; set; } = new();
     public string AuditLogPath { get; set; } = "logs/audit-.log";
+    /// <summary>Optional path for JSON structured audit log (SIEM-ready). Null = disabled.</summary>
+    public string? AuditJsonLogPath { get; set; }
     public DatadogOptions Datadog { get; set; } = new();
 }
 

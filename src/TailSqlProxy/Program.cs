@@ -57,6 +57,7 @@ builder.Services.AddScoped<ClientSession>();
 
 // Rules
 builder.Services.AddSingleton<IQueryRule, SqlInjectionRule>();
+builder.Services.AddSingleton<IQueryRule, AccessControlRule>();
 builder.Services.AddSingleton<IQueryRule, UnboundedSelectRule>();
 builder.Services.AddSingleton<IQueryRule, UnboundedDeleteRule>();
 builder.Services.AddSingleton<IQueryRule, SsmsMetadataRule>();

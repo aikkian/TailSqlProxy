@@ -574,28 +574,55 @@ public class ClientSession : IDisposable
         foreach (var packet in loginMessage.Packets)
             await _serverWriter!.WriteRawAsync(packet.RawBytes, ct);
 
-        // Forward server's login response to client
-        await ForwardServerResponseToClientAsync(ct);
+        // Forward server's login response to client.
+        // Always stop on first EOM — for FedAuth, the server sends a challenge with DONE_MORE
+        // and waits for the client's token before sending more data.
+        await ForwardServerResponseToClientAsync(ct, stopOnAnyDone: true);
 
-        if (expectFedAuth)
+        // Check if the client wants to continue with FedAuth token exchange.
+        // After the initial login response, the client may send a FedAuth token
+        // (for Entra ID/Azure AD auth) or proceed directly (for SQL auth).
+        while (true)
         {
-            var fedAuthMessage = await _clientReader!.ReadMessageAsync(ct);
-            if (fedAuthMessage == null)
-                throw new InvalidOperationException("Client disconnected during FedAuth token exchange.");
+            var nextMessage = await _clientReader!.ReadMessageAsync(ct);
+            if (nextMessage == null)
+                throw new InvalidOperationException("Client disconnected during login handshake.");
 
-            if (fedAuthMessage.Type == TdsPacketType.FederatedAuthToken)
+            if (nextMessage.Type == TdsPacketType.FederatedAuthToken)
             {
-                _logger.LogDebug("Relaying FederatedAuthToken to server (Entra ID auth)");
-                foreach (var packet in fedAuthMessage.Packets)
+                _logger.LogInformation("Relaying FedAuth token to server (Entra ID auth)");
+                foreach (var packet in nextMessage.Packets)
                     await _serverWriter!.WriteRawAsync(packet.RawBytes, ct);
-                await ForwardServerResponseToClientAsync(ct);
+
+                // Forward server's response to the FedAuth token
+                await ForwardServerResponseToClientAsync(ct, stopOnAnyDone: true);
+
+                if (string.IsNullOrEmpty(_username))
+                    _username = "entra-id-user";
             }
             else
             {
-                _logger.LogWarning("Expected FederatedAuthToken but got {Type}", fedAuthMessage.Type);
-                foreach (var packet in fedAuthMessage.Packets)
-                    await _serverWriter!.WriteRawAsync(packet.RawBytes, ct);
-                await ForwardServerResponseToClientAsync(ct);
+                // Not a FedAuth token — this is the first real message after login
+                // (e.g., a SQL batch). Push it back by processing it now.
+                // We've consumed it, so we need to handle it in the relay.
+                // Actually, we can't push it back, so let's just forward it to server
+                // and let the relay handle the response.
+                _logger.LogDebug("Post-login message type=0x{Type:X2}, forwarding to server", (byte)nextMessage.Type);
+
+                // Forward to server (this is the first query after login)
+                switch (nextMessage.Type)
+                {
+                    case TdsPacketType.SqlBatch:
+                        await HandleSqlBatchAsync(nextMessage, ct);
+                        break;
+                    case TdsPacketType.Rpc:
+                        await HandleRpcAsync(nextMessage, ct);
+                        break;
+                    default:
+                        await WriteToServerAsync(nextMessage, ct);
+                        break;
+                }
+                break;
             }
         }
     }
@@ -604,7 +631,7 @@ public class ClientSession : IDisposable
     /// Sequential response forwarding used only during login handshake (before bidirectional relay).
     /// Includes a timeout to prevent hung connections.
     /// </summary>
-    private async Task ForwardServerResponseToClientAsync(CancellationToken ct)
+    private async Task ForwardServerResponseToClientAsync(CancellationToken ct, bool stopOnAnyDone = false)
     {
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeoutCts.CancelAfter(ResponseTimeout);
@@ -622,7 +649,9 @@ public class ClientSession : IDisposable
 
             if (packet.Header.IsEndOfMessage && packet.Header.Type == TdsPacketType.TabularResult)
             {
-                if (ContainsFinalDoneToken(packet.Payload))
+                // For FedAuth: stop on any DONE token (even DONE_MORE), so the client
+                // can send the FedAuth token before the server sends more data.
+                if (stopOnAnyDone || ContainsFinalDoneToken(packet.Payload))
                     break;
             }
         }

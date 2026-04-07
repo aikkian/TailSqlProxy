@@ -83,80 +83,54 @@ public class ClientSession : IDisposable
 
             if (isTds8)
             {
-                // TDS 8.0 client + TDS 7.x server bridging
                 _logger.LogDebug("Detected TDS 8.0 client (TLS from first byte)");
 
-                // Generate a PreLogin for the server (TDS 7.x requires PreLogin before TLS)
+                // TDS 7.x server requires a PreLogin exchange before TLS, so the proxy
+                // generates one on behalf of the (TDS 8.0) client which has yet to speak.
                 var proxyPreLogin = BuildPreLoginPacket();
                 await serverNetStream.WriteAsync(proxyPreLogin, ct);
                 await serverNetStream.FlushAsync(ct);
 
-                // Read server's PreLogin response (raw TCP)
                 var rawServerReader = new TdsMessageReader(serverNetStream);
                 var serverPreLoginMsg = await rawServerReader.ReadMessageAsync(ct);
                 if (serverPreLoginMsg == null)
                     throw new InvalidOperationException("Server disconnected during PreLogin.");
-                _logger.LogDebug("Server PreLogin response received");
 
-                // TLS with server (TDS 7.x — wrapped in PreLogin packets)
-                var serverSsl = await _tlsBridge.EstablishServerTds7TlsAsync(
+                _serverStream = await _tlsBridge.EstablishServerTds7TlsAsync(
                     serverNetStream, _targetOptions.Host, ct);
-                _serverStream = serverSsl;
+                _clientStream = await _tlsBridge.AcceptClientTlsAsync(clientNetStream, ct);
+                InitializeReadersAndWriters();
 
-                // TLS with client (TDS 8.0 — raw TLS)
-                var clientSsl = await _tlsBridge.AcceptClientTlsAsync(clientNetStream, ct);
-                _clientStream = clientSsl;
-
-                _clientReader = new TdsMessageReader(_clientStream);
-                _clientWriter = new TdsMessageWriter(_clientStream);
-                _serverReader = new TdsMessageReader(_serverStream);
-                _serverWriter = new TdsMessageWriter(_serverStream);
-
-                // Forward PreLogin exchange over TLS (client expects PreLogin over TLS in TDS 8.0)
+                // Client expects PreLogin over its (now-established) TLS in TDS 8.0
                 await ForwardPreLoginAsync(ct);
             }
             else
             {
-                // TDS 7.x client + TDS 7.x server (JDBC, DataGrip)
                 _logger.LogDebug("Detected TDS 7.x client (PreLogin first)");
 
-                // Read client's PreLogin (raw TCP)
+                // Relay raw PreLogin in both directions before either side starts TLS.
                 var rawClientReader = new TdsMessageReader(clientNetStream);
                 var clientPreLogin = await rawClientReader.ReadMessageAsync(ct);
                 if (clientPreLogin == null)
                     throw new InvalidOperationException("Client disconnected during PreLogin.");
-                _logger.LogDebug("Received TDS 7.x PreLogin from client ({Len} bytes)", clientPreLogin.Payload.Length);
 
-                // Forward PreLogin to server (raw TCP)
                 foreach (var pkt in clientPreLogin.Packets)
                     await serverNetStream.WriteAsync(pkt.RawBytes, ct);
                 await serverNetStream.FlushAsync(ct);
 
-                // Read server's PreLogin response (raw TCP)
                 var rawServerReader = new TdsMessageReader(serverNetStream);
                 var serverPreLogin = await rawServerReader.ReadMessageAsync(ct);
                 if (serverPreLogin == null)
                     throw new InvalidOperationException("Server disconnected during PreLogin.");
 
-                // Forward PreLogin response to client (raw TCP)
                 foreach (var pkt in serverPreLogin.Packets)
                     await clientNetStream.WriteAsync(pkt.RawBytes, ct);
                 await clientNetStream.FlushAsync(ct);
-                _logger.LogDebug("PreLogin exchange complete");
 
-                // TLS with server (TDS 7.x — wrapped in PreLogin packets)
-                var serverSsl = await _tlsBridge.EstablishServerTds7TlsAsync(
+                _serverStream = await _tlsBridge.EstablishServerTds7TlsAsync(
                     serverNetStream, _targetOptions.Host, ct);
-                _serverStream = serverSsl;
-
-                // TLS with client (TDS 7.x — wrapped in PreLogin packets)
-                var clientSsl = await _tlsBridge.EstablishClientTds7TlsAsync(clientNetStream, ct);
-                _clientStream = clientSsl;
-
-                _clientReader = new TdsMessageReader(_clientStream);
-                _clientWriter = new TdsMessageWriter(_clientStream);
-                _serverReader = new TdsMessageReader(_serverStream);
-                _serverWriter = new TdsMessageWriter(_serverStream);
+                _clientStream = await _tlsBridge.EstablishClientTds7TlsAsync(clientNetStream, ct);
+                InitializeReadersAndWriters();
             }
 
             // Handle Login7 (extract user/db info, then forward)
@@ -178,20 +152,27 @@ public class ClientSession : IDisposable
         }
     }
 
+    private void InitializeReadersAndWriters()
+    {
+        _clientReader = new TdsMessageReader(_clientStream!);
+        _clientWriter = new TdsMessageWriter(_clientStream!);
+        _serverReader = new TdsMessageReader(_serverStream!);
+        _serverWriter = new TdsMessageWriter(_serverStream!);
+    }
+
     /// <summary>
     /// Builds a minimal TDS PreLogin packet for the proxy to send to TDS 7.x servers.
     /// Requests ENCRYPT_ON so the server agrees to TLS after PreLogin.
     /// </summary>
     private static byte[] BuildPreLoginPacket()
     {
-        // PreLogin option tokens
-        // VERSION: offset 0x15, length 6
-        // ENCRYPTION: offset 0x1B, length 1
-        // TERMINATOR: 0xFF
+        // Option entries (each: type=1 + offset=2 + length=2). Offsets are relative to the
+        // start of the PreLogin payload. With 2 options + terminator the data area starts at
+        // byte 11 (0x0B).
         var options = new byte[]
         {
-            0x00, 0x00, 0x15, 0x00, 0x06, // VERSION token
-            0x01, 0x00, 0x1B, 0x00, 0x01, // ENCRYPTION token
+            0x00, 0x00, 0x0B, 0x00, 0x06, // VERSION  at offset 11, length 6
+            0x01, 0x00, 0x11, 0x00, 0x01, // ENCRYPTION at offset 17, length 1
             0xFF,                           // TERMINATOR
         };
 
@@ -574,64 +555,43 @@ public class ClientSession : IDisposable
         foreach (var packet in loginMessage.Packets)
             await _serverWriter!.WriteRawAsync(packet.RawBytes, ct);
 
-        // Forward server's login response to client.
-        // Always stop on first EOM — for FedAuth, the server sends a challenge with DONE_MORE
-        // and waits for the client's token before sending more data.
-        await ForwardServerResponseToClientAsync(ct, stopOnAnyDone: true);
+        // Forward server's login response. Returns true if the server signalled DONE_MORE,
+        // meaning more exchanges are expected (e.g. FedAuth challenge → client token → final response).
+        bool moreExpected = await ForwardLoginResponseAsync(ct);
 
-        // Check if the client wants to continue with FedAuth token exchange.
-        // After the initial login response, the client may send a FedAuth token
-        // (for Entra ID/Azure AD auth) or proceed directly (for SQL auth).
-        while (true)
+        while (moreExpected)
         {
+            // Server is waiting for the client's next message (FedAuth token for Entra ID).
             var nextMessage = await _clientReader!.ReadMessageAsync(ct);
             if (nextMessage == null)
                 throw new InvalidOperationException("Client disconnected during login handshake.");
 
-            if (nextMessage.Type == TdsPacketType.FederatedAuthToken)
+            if (nextMessage.Type != TdsPacketType.FederatedAuthToken)
             {
-                _logger.LogInformation("Relaying FedAuth token to server (Entra ID auth)");
+                _logger.LogWarning("Expected FederatedAuthToken but got {Type}", nextMessage.Type);
                 foreach (var packet in nextMessage.Packets)
                     await _serverWriter!.WriteRawAsync(packet.RawBytes, ct);
-
-                // Forward server's response to the FedAuth token
-                await ForwardServerResponseToClientAsync(ct, stopOnAnyDone: true);
-
-                if (string.IsNullOrEmpty(_username))
-                    _username = "entra-id-user";
+                moreExpected = await ForwardLoginResponseAsync(ct);
+                continue;
             }
-            else
-            {
-                // Not a FedAuth token — this is the first real message after login
-                // (e.g., a SQL batch). Push it back by processing it now.
-                // We've consumed it, so we need to handle it in the relay.
-                // Actually, we can't push it back, so let's just forward it to server
-                // and let the relay handle the response.
-                _logger.LogDebug("Post-login message type=0x{Type:X2}, forwarding to server", (byte)nextMessage.Type);
 
-                // Forward to server (this is the first query after login)
-                switch (nextMessage.Type)
-                {
-                    case TdsPacketType.SqlBatch:
-                        await HandleSqlBatchAsync(nextMessage, ct);
-                        break;
-                    case TdsPacketType.Rpc:
-                        await HandleRpcAsync(nextMessage, ct);
-                        break;
-                    default:
-                        await WriteToServerAsync(nextMessage, ct);
-                        break;
-                }
-                break;
-            }
+            _logger.LogInformation("Relaying FedAuth token to server (Entra ID auth)");
+            foreach (var packet in nextMessage.Packets)
+                await _serverWriter!.WriteRawAsync(packet.RawBytes, ct);
+
+            moreExpected = await ForwardLoginResponseAsync(ct);
+
+            if (string.IsNullOrEmpty(_username))
+                _username = "entra-id-user";
         }
     }
 
     /// <summary>
-    /// Sequential response forwarding used only during login handshake (before bidirectional relay).
-    /// Includes a timeout to prevent hung connections.
+    /// Forwards a server-side login response to the client. Returns true if the response
+    /// ended with a DONE token that has the DONE_MORE bit set (indicating the server expects
+    /// further client input — e.g. a FedAuth token), or false if login is complete.
     /// </summary>
-    private async Task ForwardServerResponseToClientAsync(CancellationToken ct, bool stopOnAnyDone = false)
+    private async Task<bool> ForwardLoginResponseAsync(CancellationToken ct)
     {
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeoutCts.CancelAfter(ResponseTimeout);
@@ -641,21 +601,17 @@ public class ClientSession : IDisposable
             var packet = await _serverReader!.ReadPacketAsync(timeoutCts.Token);
             if (packet == null)
             {
-                _logger.LogWarning("Server disconnected during response forwarding");
-                break;
+                _logger.LogWarning("Server disconnected during login response forwarding");
+                return false;
             }
 
             await _clientWriter!.WriteRawAsync(packet.RawBytes, timeoutCts.Token);
 
             if (packet.Header.IsEndOfMessage && packet.Header.Type == TdsPacketType.TabularResult)
-            {
-                // For FedAuth: stop on any DONE token (even DONE_MORE), so the client
-                // can send the FedAuth token before the server sends more data.
-                if (stopOnAnyDone || ContainsFinalDoneToken(packet.Payload))
-                    break;
-            }
+                return !ContainsFinalDoneToken(packet.Payload);
         }
     }
+
 
     /// <summary>
     /// Checks if the packet payload ends with a DONE or DONEPROC token

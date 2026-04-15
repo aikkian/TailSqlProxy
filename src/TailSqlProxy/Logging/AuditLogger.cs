@@ -85,6 +85,20 @@ public class AuditLogger : IAuditLogger, IDisposable
             Truncate(context.SqlText));
     }
 
+    public void LogTimeoutKilled(QueryContext context, double timeoutMs)
+    {
+        _auditLog.Warning(
+            "TIMEOUT_KILLED | Time={UtcDateTime} | Session={SessionId} | IP={ClientIp} | " +
+            "User={Username} | DB={Database} | App={AppName} | Duration={DurationMs}ms | " +
+            "Timeout={TimeoutMs}ms | SQL={SqlText}",
+            DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff"),
+            context.SessionId,
+            context.ClientIp, context.Username, context.Database, context.AppName,
+            context.DurationMs?.ToString("F1") ?? "-",
+            timeoutMs.ToString("F0"),
+            Truncate(context.SqlText));
+    }
+
     public void LogBlocked(QueryContext context, string reason)
     {
         _auditLog.Warning(

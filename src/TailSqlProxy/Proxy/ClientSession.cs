@@ -47,6 +47,13 @@ public class ClientSession : IDisposable
     // Pending queries awaiting server response (for duration tracking)
     private readonly ConcurrentQueue<QueryContext> _pendingQueries = new();
 
+    // Active query timeout: CTS that fires when the current query exceeds its allowed duration.
+    // Set in HandleSqlBatchAsync/HandleRpcAsync when rule returns AllowWithTimeout.
+    // Checked in RelayServerToClientAsync; fires SendAttentionAsync to kill the query.
+    private CancellationTokenSource? _queryTimeoutCts;
+    private QueryContext? _timeoutQueryContext;
+    private double _activeTimeoutMs;
+
     // Timeout for response forwarding (prevents hung connections)
     private static readonly TimeSpan ResponseTimeout = TimeSpan.FromMinutes(5);
 
@@ -281,12 +288,32 @@ public class ClientSession : IDisposable
     /// Runs independently of the client→server direction.
     /// All server responses (result sets, errors, DONE tokens) flow through here.
     /// Detects query completion via DONE tokens and records duration metrics.
+    /// Monitors query timeouts and sends Attention signals to cancel long-running queries.
     /// </summary>
     private async Task RelayServerToClientAsync(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
         {
-            var packet = await _serverReader!.ReadPacketAsync(ct);
+            // Check if query timeout has fired — send Attention to cancel on server
+            if (_queryTimeoutCts is { IsCancellationRequested: true })
+            {
+                await OnQueryTimeoutAsync(ct);
+            }
+
+            TdsPacket? packet;
+            try
+            {
+                // Use a short read timeout so we can periodically check the query timeout CTS
+                using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                readCts.CancelAfter(TimeSpan.FromMilliseconds(500));
+                packet = await _serverReader!.ReadPacketAsync(readCts.Token);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                // Read timed out (500ms polling interval) — loop back to check timeout CTS
+                continue;
+            }
+
             if (packet == null)
             {
                 _logger.LogDebug("Server disconnected");
@@ -301,9 +328,66 @@ public class ClientSession : IDisposable
             {
                 if (TryExtractDoneInfo(packet.Payload, out long rowCount, out bool isFinal) && isFinal)
                 {
+                    CancelQueryTimeout();
                     OnQueryCompleted(rowCount);
                 }
             }
+        }
+    }
+
+    /// <summary>
+    /// Sends a TDS Attention signal (0x06) to the server to cancel the currently executing query.
+    /// Called when a query exceeds its allowed timeout duration.
+    /// </summary>
+    private async Task OnQueryTimeoutAsync(CancellationToken ct)
+    {
+        var context = _timeoutQueryContext;
+        var timeoutMs = _activeTimeoutMs;
+        CancelQueryTimeout();
+
+        if (context != null)
+        {
+            context.DurationMs = context.StartTimeUtc.HasValue
+                ? (DateTime.UtcNow - context.StartTimeUtc.Value).TotalMilliseconds
+                : timeoutMs;
+
+            _auditLogger.LogTimeoutKilled(context, timeoutMs);
+            _metrics.RecordTimeoutKilled(_username, _database);
+            _logger.LogWarning(
+                "Query timeout exceeded ({TimeoutMs}ms) — sending Attention to cancel | User={Username} | SQL={Sql}",
+                timeoutMs, _username,
+                context.SqlText.Length > 200 ? context.SqlText[..200] + "..." : context.SqlText);
+        }
+
+        await SendAttentionAsync(ct);
+    }
+
+    /// <summary>
+    /// Sends a TDS Attention packet (type 0x06) to the server.
+    /// This is the TDS protocol mechanism to cancel a running query.
+    /// The server will respond with a DONE token with the DONE_ATTN (0x0020) status bit.
+    /// </summary>
+    private async Task SendAttentionAsync(CancellationToken ct)
+    {
+        // Attention packet: 8-byte TDS header with type=0x06, status=EOM, length=8, no payload
+        var attentionPacket = new byte[TdsPacketHeader.Size];
+        var header = new TdsPacketHeader(
+            type: TdsPacketType.Attention,
+            status: (byte)TdsStatusBits.EndOfMessage,
+            length: TdsPacketHeader.Size,
+            spid: 0,
+            packetId: 1,
+            window: 0);
+        header.WriteTo(attentionPacket);
+
+        await _serverWriteLock.WaitAsync(ct);
+        try
+        {
+            await _serverWriter!.WriteRawAsync(attentionPacket, ct);
+        }
+        finally
+        {
+            _serverWriteLock.Release();
         }
     }
 
@@ -394,6 +478,7 @@ public class ClientSession : IDisposable
 
         _auditLogger.LogQuery(context);
         _pendingQueries.Enqueue(context);
+        StartQueryTimeout(result, context);
         await WriteToServerAsync(message, ct);
     }
 
@@ -416,7 +501,38 @@ public class ClientSession : IDisposable
 
         _auditLogger.LogQuery(context);
         _pendingQueries.Enqueue(context);
+        StartQueryTimeout(result, context);
         await WriteToServerAsync(message, ct);
+    }
+
+    /// <summary>
+    /// Starts a timeout timer if the rule result includes AllowWithTimeout.
+    /// When the timer fires, SendAttentionAsync is called to cancel the query on the server.
+    /// </summary>
+    private void StartQueryTimeout(RuleResult result, QueryContext context)
+    {
+        // Cancel any previous timeout
+        CancelQueryTimeout();
+
+        if (!result.HasTimeout)
+            return;
+
+        _activeTimeoutMs = result.TimeoutMs!.Value;
+        _timeoutQueryContext = context;
+        _queryTimeoutCts = new CancellationTokenSource();
+        _queryTimeoutCts.CancelAfter(TimeSpan.FromMilliseconds(_activeTimeoutMs));
+
+        _logger.LogInformation(
+            "Query timeout armed: {TimeoutMs}ms | User={Username} | Reason={Reason} | SQL={Sql}",
+            _activeTimeoutMs, _username, result.Reason,
+            context.SqlText.Length > 200 ? context.SqlText[..200] + "..." : context.SqlText);
+    }
+
+    private void CancelQueryTimeout()
+    {
+        _queryTimeoutCts?.Dispose();
+        _queryTimeoutCts = null;
+        _timeoutQueryContext = null;
     }
 
     /// <summary>
@@ -714,6 +830,7 @@ public class ClientSession : IDisposable
 
     public void Dispose()
     {
+        _queryTimeoutCts?.Dispose();
         _clientWriteLock.Dispose();
         _serverWriteLock.Dispose();
         _clientStream?.Dispose();

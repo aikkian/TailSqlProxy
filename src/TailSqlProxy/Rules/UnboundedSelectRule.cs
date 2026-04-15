@@ -8,6 +8,8 @@ namespace TailSqlProxy.Rules;
 public class UnboundedSelectRule : IQueryRule
 {
     private readonly ILogger<UnboundedSelectRule> _logger;
+    private readonly UnboundedQueryMode _mode;
+    private readonly double _timeoutMs;
 
     public string Name => "UnboundedSelect";
     public bool IsEnabled { get; }
@@ -15,7 +17,10 @@ public class UnboundedSelectRule : IQueryRule
     public UnboundedSelectRule(IOptions<RuleOptions> options, ILogger<UnboundedSelectRule> logger)
     {
         _logger = logger;
-        IsEnabled = options.Value.UnboundedSelect?.Enabled ?? true;
+        var opts = options.Value.UnboundedSelect;
+        IsEnabled = opts?.Enabled ?? true;
+        _mode = opts?.Mode ?? UnboundedQueryMode.Block;
+        _timeoutMs = opts?.TimeoutMs ?? 300_000;
     }
 
     public RuleResult Evaluate(QueryContext context)
@@ -41,7 +46,12 @@ public class UnboundedSelectRule : IQueryRule
         fragment.Accept(visitor);
 
         if (visitor.HasViolation)
-            return RuleResult.Block($"SELECT without TOP or WHERE clause is not allowed. Fragment: {visitor.OffendingFragment}");
+        {
+            var reason = $"SELECT without TOP or WHERE clause. Fragment: {visitor.OffendingFragment}";
+            return _mode == UnboundedQueryMode.Timeout
+                ? RuleResult.AllowWithTimeout(_timeoutMs, reason)
+                : RuleResult.Block(reason);
+        }
 
         return RuleResult.Allow;
     }

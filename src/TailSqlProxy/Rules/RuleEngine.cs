@@ -31,6 +31,8 @@ public class RuleEngine : IRuleEngine
         if (IsBypassed(context))
             return RuleResult.Allow;
 
+        RuleResult? timeoutResult = null;
+
         foreach (var rule in _rules)
         {
             if (!rule.IsEnabled)
@@ -43,9 +45,24 @@ public class RuleEngine : IRuleEngine
                     rule.Name, result.Reason, context.Username, context.ClientIp);
                 return result;
             }
+
+            // Track the tightest (smallest) timeout from any rule
+            if (result.HasTimeout)
+            {
+                if (timeoutResult == null || result.TimeoutMs!.Value < timeoutResult.TimeoutMs!.Value)
+                    timeoutResult = result;
+            }
         }
 
-        return RuleResult.Allow;
+        // Apply global default timeout if no rule-specific timeout was set
+        if (timeoutResult == null && _options.QueryTimeout is { Enabled: true, DefaultTimeoutMs: > 0 })
+        {
+            return RuleResult.AllowWithTimeout(
+                _options.QueryTimeout.DefaultTimeoutMs,
+                "Global query timeout");
+        }
+
+        return timeoutResult ?? RuleResult.Allow;
     }
 
     private bool IsBypassed(QueryContext context)

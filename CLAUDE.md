@@ -4,7 +4,7 @@
 
 TDS (Tabular Data Stream) protocol proxy for Azure SQL Database. Sits between SQL clients (SSMS, applications) and Azure SQL to monitor, audit, and control all SQL traffic. Inspired by DataSunrise's database security approach.
 
-**Target:** .NET 10.0 | **Tests:** 292 (xUnit + FluentAssertions) | **Solution:** `TailSqlProxy.sln`
+**Target:** .NET 10.0 | **Tests:** 329 (xUnit + FluentAssertions) | **Solution:** `TailSqlProxy.sln`
 
 ## Quick Commands
 
@@ -34,7 +34,7 @@ src/TailSqlProxy/
 ├── appsettings.json                    # All configuration
 ├── Configuration/
 │   ├── ProxyOptions.cs                 # Proxy, cert, Datadog config
-│   ├── RuleOptions.cs                  # Rule toggles, bypass lists, SQL injection options
+│   ├── RuleOptions.cs                  # Rule toggles, bypass lists, SQL injection options, UnboundedQueryMode enum, QueryTimeoutOptions
 │   ├── TargetServerOptions.cs          # Target Azure SQL host/port
 │   └── MetricsOptions.cs              # Prometheus metrics, slow query threshold, histogram buckets
 ├── Hosting/
@@ -57,24 +57,24 @@ src/TailSqlProxy/
 │       └── TdsResponseBuilder.cs       # ERROR token (0xAA) + DONE token (0xFD) builder
 ├── Monitoring/
 │   ├── IProxyMetrics.cs                # Interface: query/connection/byte metrics
-│   ├── ProxyMetrics.cs                 # Prometheus counters, histograms, gauges (8 metric families)
+│   ├── ProxyMetrics.cs                 # Prometheus counters, histograms, gauges (9 metric families)
 │   ├── NullProxyMetrics.cs             # No-op implementation when metrics disabled
 │   └── MetricsHostedService.cs         # HTTP /metrics endpoint for Prometheus scraping
 ├── Proxy/
 │   ├── TdsProxyServer.cs               # TCP listener, atomic connection limit, connection metrics
-│   ├── ClientSession.cs                # Bidirectional relay, query duration tracking, DONE token parsing
+│   ├── ClientSession.cs                # Bidirectional relay, query duration tracking, DONE token parsing, timeout enforcement via TDS Attention
 │   ├── TlsBridge.cs                    # TLS MITM (TDS 8.0 + 7.x), TdsPreLoginWrapperStream
 │   └── CertificateProvider.cs          # Lazy<T> thread-safe cert, auto-gen self-signed RSA-2048
 └── Rules/
     ├── IQueryRule.cs                   # Interface: Name, IsEnabled, Evaluate(QueryContext)
     ├── IRuleEngine.cs                  # Interface: Evaluate(QueryContext) → RuleResult
     ├── QueryContext.cs                 # SqlText, ProcedureName, IsRpc, ClientIp, HostName, Username, Database, AppName, SessionId
-    ├── RuleResult.cs                   # Sealed record: IsBlocked, Reason; static Allow/Block()
-    ├── RuleEngine.cs                   # Bypass check → iterate rules; BypassUsers/AppNames/ClientIps
+    ├── RuleResult.cs                   # Sealed record: IsBlocked, Reason, TimeoutMs; static Allow/Block()/AllowWithTimeout()
+    ├── RuleEngine.cs                   # Bypass check → iterate rules → tightest timeout; BypassUsers/AppNames/ClientIps, global QueryTimeout fallback
     ├── SqlInjectionRule.cs             # Dual-layer: 29 regex patterns + AST visitor (tautology, UNION, stacked, WAITFOR, xp_cmdshell)
     ├── AccessControlRule.cs            # AST: policy-based table/column/operation access control
-    ├── UnboundedSelectRule.cs          # AST: blocks SELECT * without WHERE/TOP
-    ├── UnboundedDeleteRule.cs          # AST: blocks DELETE without WHERE/TOP
+    ├── UnboundedSelectRule.cs          # AST: SELECT * without WHERE/TOP — Mode=Block or Mode=Timeout
+    ├── UnboundedDeleteRule.cs          # AST: DELETE without WHERE/TOP — Mode=Block or Mode=Timeout
     └── SsmsMetadataRule.cs             # Regex + HashSet: 40+ catalog views, 40+ procs, DMVs, SERVERPROPERTY, app-name filtering
 
 tests/TailSqlProxy.Tests/
@@ -91,6 +91,7 @@ tests/TailSqlProxy.Tests/
     ├── RuleEngineBypassTests.cs        # 12 tests — user/app/IP bypass, case sensitivity
     ├── UnboundedSelectRuleTests.cs     # 7 tests — SELECT * blocked/allowed scenarios
     ├── UnboundedDeleteRuleTests.cs     # 5 tests — DELETE blocked/allowed scenarios
+    ├── QueryTimeoutTests.cs            # 37 tests — RuleResult tri-state, timeout modes, RuleEngine propagation, config defaults
     └── SsmsMetadataRuleTests.cs        # 60 tests — procs, views, DMVs, server props, SET, app-name filter
 ```
 
@@ -114,8 +115,9 @@ Key sections:
 - **`TargetServer`** — Host (Azure SQL FQDN), Port
 - **`Rules`** — BypassUsers[], BypassAppNames[], BypassClientIps[]
   - `SqlInjection` — Enabled, BlockOnParseErrors, CustomPatterns[]
-  - `UnboundedSelect` — Enabled
-  - `UnboundedDelete` — Enabled
+  - `UnboundedSelect` — Enabled, Mode (Block|Timeout), TimeoutMs (default 300000 = 5 min)
+  - `UnboundedDelete` — Enabled, Mode (Block|Timeout), TimeoutMs (default 300000 = 5 min)
+  - `QueryTimeout` — Enabled, DefaultTimeoutMs (global fallback timeout for all queries)
   - `AccessControl` — Enabled, Policies[] (Name, Priority, Action, Users, AppNames, ClientIps, Database, ObjectPattern, Columns, Operations)
   - `SsmsMetadata` — Enabled, BlockedProcedures[], BlockedSystemViews[], BlockedSchemas[], AllowedPatterns[], BlockedAppNames[], BlockServerProperties, BlockDmvs, BlockSetStatements
 - **`Metrics`** — Enabled, Port (9090), SlowQueryThresholdMs (3600000 = 1 hour), DurationBuckets[]
@@ -125,8 +127,8 @@ Key sections:
 | Rule | Detection | Blocks |
 |------|-----------|--------|
 | **SqlInjection** | AST + 29 regex patterns | Tautologies (OR 1=1), UNION injection, stacked queries (;DROP), time-based (WAITFOR DELAY), xp_cmdshell, sp_OACreate, OPENROWSET, hex encoding, comment evasion, @@version probing |
-| **UnboundedSelect** | AST (TSql170Parser) | SELECT * FROM table without WHERE or TOP |
-| **UnboundedDelete** | AST (TSql170Parser) | DELETE FROM table without WHERE or TOP |
+| **UnboundedSelect** | AST (TSql170Parser) | SELECT * without WHERE or TOP — Block mode: reject; Timeout mode: allow then kill via TDS Attention after TimeoutMs |
+| **UnboundedDelete** | AST (TSql170Parser) | DELETE without WHERE or TOP — Block mode: reject; Timeout mode: allow then kill via TDS Attention after TimeoutMs |
 | **AccessControl** | AST (TSql170Parser) | Policy-based table/column/operation access control with user/app/IP/DB scoping, priority ordering |
 | **SsmsMetadata** | Regex + HashSet | 40+ catalog views, 40+ metadata procs, DMVs, SERVERPROPERTY, SET statements, app-name filtering |
 
@@ -170,6 +172,7 @@ Services:
 - **Phase 4:** Dynamic data masking (column-based, role-aware, TDS response rewriting)
 - **Phase 5:** Sensitive data discovery (auto-scan INFORMATION_SCHEMA, PII/PHI pattern matching), query whitelist/learning mode
 - **Phase 6:** ~~Query performance monitoring (slow query detection, Prometheus metrics)~~ ✓ DONE — management REST API (deferred)
+- **Phase 7:** ~~Query timeout enforcement (unbounded query timeout mode, TDS Attention signal, global query timeout)~~ ✓ DONE
 
 ## Development Notes
 
@@ -183,6 +186,11 @@ Services:
 - AccessControl uses AST visitor to extract table/column references from SELECT/INSERT/UPDATE/DELETE including JOINs
 - Audit logger writes dual output: rolling text file + structured JSON (CompactJsonFormatter) with session IDs
 - Query duration tracked via DONE token detection in server→client relay; ConcurrentQueue for pending query contexts
-- Prometheus metrics: 8 metric families (queries_total, blocked_queries_total, slow_queries_total, query_duration_seconds histogram, active_connections gauge, connections_total, rejected_connections_total, bytes_relayed_total)
+- Prometheus metrics: 9 metric families (queries_total, blocked_queries_total, slow_queries_total, query_duration_seconds histogram, active_connections gauge, connections_total, rejected_connections_total, bytes_relayed_total, timeout_killed_total)
 - Slow query detector logs SLOW_QUERY entries when duration exceeds configurable threshold (default 1 hour)
 - Metrics HTTP endpoint on configurable port (default 9090) using HttpListener; disabled when Metrics.Enabled = false
+- RuleResult tri-state: Allow / Block / AllowWithTimeout(ms, reason) — enables runtime query governance
+- Query timeout enforcement: CancellationTokenSource.CancelAfter + TDS Attention signal (packet type 0x06) kills long-running queries
+- UnboundedSelect/Delete rules support Mode=Block (reject immediately) or Mode=Timeout (allow but kill after TimeoutMs)
+- RuleEngine picks tightest (smallest) timeout when multiple rules return AllowWithTimeout; falls back to global QueryTimeout
+- Timeout polling: server→client relay uses 500ms read timeout to check for timeout CTS cancellation

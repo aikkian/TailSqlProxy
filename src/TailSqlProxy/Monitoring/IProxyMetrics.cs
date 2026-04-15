@@ -15,6 +15,9 @@ public interface IProxyMetrics
     /// <summary>Record a slow query (above threshold).</summary>
     void RecordSlowQuery(string? user, string? database, double durationSeconds);
 
+    /// <summary>Record a query killed by timeout enforcement.</summary>
+    void RecordTimeoutKilled(string? user, string? database);
+
     /// <summary>Increment active connection gauge.</summary>
     void IncrementActiveConnections();
 

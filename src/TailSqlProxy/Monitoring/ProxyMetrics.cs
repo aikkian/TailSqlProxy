@@ -18,6 +18,7 @@ public sealed class ProxyMetrics : IProxyMetrics
     private readonly Counter _connectionsTotal;
     private readonly Counter _rejectedConnectionsTotal;
     private readonly Counter _bytesRelayedTotal;
+    private readonly Counter _timeoutKilledTotal;
 
     public ProxyMetrics(IOptions<MetricsOptions> options)
         : this(options, Metrics.DefaultRegistry)
@@ -82,6 +83,14 @@ public sealed class ProxyMetrics : IProxyMetrics
             {
                 LabelNames = ["direction"] // "client_to_server" or "server_to_client"
             });
+
+        _timeoutKilledTotal = factory.CreateCounter(
+            "tailsqlproxy_timeout_killed_total",
+            "Total number of queries killed by timeout enforcement.",
+            new CounterConfiguration
+            {
+                LabelNames = ["user", "database"]
+            });
     }
 
     public void RecordQuery(string? user, string? database, string? appName, double durationSeconds)
@@ -108,6 +117,11 @@ public sealed class ProxyMetrics : IProxyMetrics
     public void DecrementActiveConnections() => _activeConnections.Dec();
     public void RecordConnection() => _connectionsTotal.Inc();
     public void RecordRejectedConnection() => _rejectedConnectionsTotal.Inc();
+
+    public void RecordTimeoutKilled(string? user, string? database)
+    {
+        _timeoutKilledTotal.WithLabels(user ?? "unknown", database ?? "unknown").Inc();
+    }
 
     public void RecordBytesRelayed(long bytes, string direction)
     {

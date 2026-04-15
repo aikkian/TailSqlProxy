@@ -4,6 +4,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using TailSqlProxy.Configuration;
+using TailSqlProxy.Monitoring;
 
 namespace TailSqlProxy.Proxy;
 
@@ -11,6 +12,7 @@ public class TdsProxyServer
 {
     private readonly ProxyOptions _options;
     private readonly IServiceProvider _serviceProvider;
+    private readonly IProxyMetrics _metrics;
     private readonly ILogger<TdsProxyServer> _logger;
     private TcpListener? _listener;
     private int _activeConnections;
@@ -18,10 +20,12 @@ public class TdsProxyServer
     public TdsProxyServer(
         IOptions<ProxyOptions> options,
         IServiceProvider serviceProvider,
+        IProxyMetrics metrics,
         ILogger<TdsProxyServer> logger)
     {
         _options = options.Value;
         _serviceProvider = serviceProvider;
+        _metrics = metrics;
         _logger = logger;
     }
 
@@ -47,11 +51,15 @@ public class TdsProxyServer
                 if (count > _options.MaxConcurrentConnections)
                 {
                     Interlocked.Decrement(ref _activeConnections);
+                    _metrics.RecordRejectedConnection();
                     _logger.LogWarning("Max concurrent connections ({Max}) reached. Rejecting connection from {ClientIp}",
                         _options.MaxConcurrentConnections, clientEndpoint?.Address);
                     client.Close();
                     continue;
                 }
+
+                _metrics.RecordConnection();
+                _metrics.IncrementActiveConnections();
 
                 _ = HandleClientAsync(client, ct);
             }
@@ -83,6 +91,7 @@ public class TdsProxyServer
         finally
         {
             Interlocked.Decrement(ref _activeConnections);
+            _metrics.DecrementActiveConnections();
             try { client.Close(); } catch { /* ignore */ }
         }
     }

@@ -71,6 +71,20 @@ public class AuditLogger : IAuditLogger, IDisposable
             Truncate(context.SqlText));
     }
 
+    public void LogSlowQuery(QueryContext context)
+    {
+        _auditLog.Warning(
+            "SLOW_QUERY | Time={UtcDateTime} | Session={SessionId} | IP={ClientIp} | " +
+            "User={Username} | DB={Database} | App={AppName} | Duration={DurationMs}ms | " +
+            "Rows={RowCount} | SQL={SqlText}",
+            DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss.fff"),
+            context.SessionId,
+            context.ClientIp, context.Username, context.Database, context.AppName,
+            context.DurationMs?.ToString("F1") ?? "-",
+            context.RowCount?.ToString() ?? "-",
+            Truncate(context.SqlText));
+    }
+
     public void LogBlocked(QueryContext context, string reason)
     {
         _auditLog.Warning(

@@ -4,13 +4,13 @@
 
 TDS (Tabular Data Stream) protocol proxy for Azure SQL Database. Sits between SQL clients (SSMS, applications) and Azure SQL to monitor, audit, and control all SQL traffic. Inspired by DataSunrise's database security approach.
 
-**Target:** .NET 10.0 | **Tests:** 264 (xUnit + FluentAssertions) | **Solution:** `TailSqlProxy.sln`
+**Target:** .NET 10.0 | **Tests:** 292 (xUnit + FluentAssertions) | **Solution:** `TailSqlProxy.sln`
 
 ## Quick Commands
 
 ```bash
 dotnet build                  # Build solution
-dotnet test                   # Run all 264 tests
+dotnet test                   # Run all 292 tests
 dotnet run --project src/TailSqlProxy  # Run proxy
 ```
 
@@ -35,7 +35,8 @@ src/TailSqlProxy/
 ├── Configuration/
 │   ├── ProxyOptions.cs                 # Proxy, cert, Datadog config
 │   ├── RuleOptions.cs                  # Rule toggles, bypass lists, SQL injection options
-│   └── TargetServerOptions.cs          # Target Azure SQL host/port
+│   ├── TargetServerOptions.cs          # Target Azure SQL host/port
+│   └── MetricsOptions.cs              # Prometheus metrics, slow query threshold, histogram buckets
 ├── Hosting/
 │   └── ProxyHostedService.cs           # BackgroundService wrapper
 ├── Logging/
@@ -54,9 +55,14 @@ src/TailSqlProxy/
 │       ├── SqlBatchMessage.cs          # ALL_HEADERS skip, UTF-16LE SQL extraction
 │       ├── RpcRequestMessage.cs        # Proc name + sp_executesql SQL (15 well-known proc IDs)
 │       └── TdsResponseBuilder.cs       # ERROR token (0xAA) + DONE token (0xFD) builder
+├── Monitoring/
+│   ├── IProxyMetrics.cs                # Interface: query/connection/byte metrics
+│   ├── ProxyMetrics.cs                 # Prometheus counters, histograms, gauges (8 metric families)
+│   ├── NullProxyMetrics.cs             # No-op implementation when metrics disabled
+│   └── MetricsHostedService.cs         # HTTP /metrics endpoint for Prometheus scraping
 ├── Proxy/
-│   ├── TdsProxyServer.cs               # TCP listener, atomic connection limit
-│   ├── ClientSession.cs                # Bidirectional relay, SemaphoreSlim write locks, MARS
+│   ├── TdsProxyServer.cs               # TCP listener, atomic connection limit, connection metrics
+│   ├── ClientSession.cs                # Bidirectional relay, query duration tracking, DONE token parsing
 │   ├── TlsBridge.cs                    # TLS MITM (TDS 8.0 + 7.x), TdsPreLoginWrapperStream
 │   └── CertificateProvider.cs          # Lazy<T> thread-safe cert, auto-gen self-signed RSA-2048
 └── Rules/
@@ -72,6 +78,9 @@ src/TailSqlProxy/
     └── SsmsMetadataRule.cs             # Regex + HashSet: 40+ catalog views, 40+ procs, DMVs, SERVERPROPERTY, app-name filtering
 
 tests/TailSqlProxy.Tests/
+├── Monitoring/
+│   ├── ProxyMetricsTests.cs            # 11 tests — counters, histograms, gauges, null metrics
+│   └── SlowQueryDetectionTests.cs      # 17 tests — threshold detection, DONE token parsing, metrics integration
 ├── Protocol/
 │   ├── TdsPacketHeaderTests.cs         # 7 tests — header parsing, big-endian, round-trip
 │   ├── TdsMessageReaderTests.cs        # 5 tests — single/multi-packet, empty stream
@@ -94,6 +103,7 @@ tests/TailSqlProxy.Tests/
 | Serilog.Extensions.Hosting | 10.0.0 | Structured logging |
 | Serilog.Sinks.Datadog.Logs | 0.6.0 | Datadog integration |
 | Serilog.Sinks.File | 7.0.0 | Daily-rolling audit logs |
+| prometheus-net | 8.2.1 | Prometheus metrics (counters, histograms, gauges) |
 | FluentAssertions | 8.9.0 | Test assertions |
 | xunit | 2.9.3 | Test framework |
 
@@ -108,6 +118,7 @@ Key sections:
   - `UnboundedDelete` — Enabled
   - `AccessControl` — Enabled, Policies[] (Name, Priority, Action, Users, AppNames, ClientIps, Database, ObjectPattern, Columns, Operations)
   - `SsmsMetadata` — Enabled, BlockedProcedures[], BlockedSystemViews[], BlockedSchemas[], AllowedPatterns[], BlockedAppNames[], BlockServerProperties, BlockDmvs, BlockSetStatements
+- **`Metrics`** — Enabled, Port (9090), SlowQueryThresholdMs (5000), DurationBuckets[]
 
 ## SQL Firewall Rules
 
@@ -147,6 +158,8 @@ Services:
   Singleton  → SqlInjectionRule, AccessControlRule, UnboundedSelectRule, UnboundedDeleteRule, SsmsMetadataRule (IQueryRule)
   Singleton  → RuleEngine (IRuleEngine)
   Singleton  → AuditLogger (IAuditLogger)
+  Singleton  → ProxyMetrics (IProxyMetrics) — or NullProxyMetrics if disabled
+  Hosted     → MetricsHostedService (Prometheus /metrics HTTP endpoint)
   Hosted     → ProxyHostedService
 ```
 
@@ -156,7 +169,7 @@ Services:
 - **Phase 3:** Real-time alerting (webhook, email, Syslog), rate limiting (per-user query throttling)
 - **Phase 4:** Dynamic data masking (column-based, role-aware, TDS response rewriting)
 - **Phase 5:** Sensitive data discovery (auto-scan INFORMATION_SCHEMA, PII/PHI pattern matching), query whitelist/learning mode
-- **Phase 6:** Query performance monitoring (slow query detection, Prometheus metrics), management REST API
+- **Phase 6:** ~~Query performance monitoring (slow query detection, Prometheus metrics)~~ ✓ DONE — management REST API (deferred)
 
 ## Development Notes
 
@@ -169,3 +182,7 @@ Services:
 - SsmsMetadata rule supports app-name-based blocking (only block from SSMS, allow app queries through)
 - AccessControl uses AST visitor to extract table/column references from SELECT/INSERT/UPDATE/DELETE including JOINs
 - Audit logger writes dual output: rolling text file + structured JSON (CompactJsonFormatter) with session IDs
+- Query duration tracked via DONE token detection in server→client relay; ConcurrentQueue for pending query contexts
+- Prometheus metrics: 8 metric families (queries_total, blocked_queries_total, slow_queries_total, query_duration_seconds histogram, active_connections gauge, connections_total, rejected_connections_total, bytes_relayed_total)
+- Slow query detector logs SLOW_QUERY entries when duration exceeds configurable threshold (default 5000ms)
+- Metrics HTTP endpoint on configurable port (default 9090) using HttpListener; disabled when Metrics.Enabled = false

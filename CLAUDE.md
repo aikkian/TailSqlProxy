@@ -118,7 +118,7 @@ Key sections:
   - `UnboundedDelete` — Enabled
   - `AccessControl` — Enabled, Policies[] (Name, Priority, Action, Users, AppNames, ClientIps, Database, ObjectPattern, Columns, Operations)
   - `SsmsMetadata` — Enabled, BlockedProcedures[], BlockedSystemViews[], BlockedSchemas[], AllowedPatterns[], BlockedAppNames[], BlockServerProperties, BlockDmvs, BlockSetStatements
-- **`Metrics`** — Enabled, Port (9090), SlowQueryThresholdMs (5000), DurationBuckets[]
+- **`Metrics`** — Enabled, Port (9090), SlowQueryThresholdMs (3600000 = 1 hour), DurationBuckets[]
 
 ## SQL Firewall Rules
 
@@ -184,5 +184,5 @@ Services:
 - Audit logger writes dual output: rolling text file + structured JSON (CompactJsonFormatter) with session IDs
 - Query duration tracked via DONE token detection in server→client relay; ConcurrentQueue for pending query contexts
 - Prometheus metrics: 8 metric families (queries_total, blocked_queries_total, slow_queries_total, query_duration_seconds histogram, active_connections gauge, connections_total, rejected_connections_total, bytes_relayed_total)
-- Slow query detector logs SLOW_QUERY entries when duration exceeds configurable threshold (default 5000ms)
+- Slow query detector logs SLOW_QUERY entries when duration exceeds configurable threshold (default 1 hour)
 - Metrics HTTP endpoint on configurable port (default 9090) using HttpListener; disabled when Metrics.Enabled = false

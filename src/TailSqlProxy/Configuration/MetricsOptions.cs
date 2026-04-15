@@ -9,7 +9,7 @@ public class MetricsOptions
     public int Port { get; set; } = 9090;
 
     /// <summary>Queries exceeding this duration (ms) are logged as slow queries.</summary>
-    public double SlowQueryThresholdMs { get; set; } = 5000;
+    public double SlowQueryThresholdMs { get; set; } = 3_600_000;
 
     /// <summary>
     /// Histogram bucket boundaries (in seconds) for query duration distribution.

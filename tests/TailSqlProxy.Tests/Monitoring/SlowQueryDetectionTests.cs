@@ -140,7 +140,7 @@ public class SlowQueryDetectionTests
 
         options.Enabled.Should().BeFalse();
         options.Port.Should().Be(9090);
-        options.SlowQueryThresholdMs.Should().Be(5000);
+        options.SlowQueryThresholdMs.Should().Be(3_600_000);
         options.DurationBuckets.Should().HaveCountGreaterThan(5);
     }
 

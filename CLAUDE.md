@@ -4,13 +4,13 @@
 
 TDS (Tabular Data Stream) protocol proxy for Azure SQL Database. Sits between SQL clients (SSMS, applications) and Azure SQL to monitor, audit, and control all SQL traffic. Inspired by DataSunrise's database security approach.
 
-**Target:** .NET 10.0 | **Tests:** 186 (xUnit + FluentAssertions) | **Solution:** `TailSqlProxy.sln`
+**Target:** .NET 10.0 | **Tests:** 264 (xUnit + FluentAssertions) | **Solution:** `TailSqlProxy.sln`
 
 ## Quick Commands
 
 ```bash
 dotnet build                  # Build solution
-dotnet test                   # Run all 186 tests
+dotnet test                   # Run all 264 tests
 dotnet run --project src/TailSqlProxy  # Run proxy
 ```
 
@@ -40,7 +40,7 @@ src/TailSqlProxy/
 │   └── ProxyHostedService.cs           # BackgroundService wrapper
 ├── Logging/
 │   ├── IAuditLogger.cs                 # Interface
-│   └── AuditLogger.cs                  # Serilog File + Datadog sinks, UTC timestamps
+│   └── AuditLogger.cs                  # Serilog File + JSON (CompactJsonFormatter) + Datadog sinks, session tracking
 ├── Protocol/
 │   ├── TdsPacketType.cs                # Enum: SqlBatch(0x01), Rpc(0x03), Login7(0x10), etc.
 │   ├── TdsStatusBits.cs                # Flags: EndOfMessage, ResetConnection
@@ -62,13 +62,14 @@ src/TailSqlProxy/
 └── Rules/
     ├── IQueryRule.cs                   # Interface: Name, IsEnabled, Evaluate(QueryContext)
     ├── IRuleEngine.cs                  # Interface: Evaluate(QueryContext) → RuleResult
-    ├── QueryContext.cs                 # SqlText, ProcedureName, IsRpc, ClientIp, HostName, Username, Database, AppName
+    ├── QueryContext.cs                 # SqlText, ProcedureName, IsRpc, ClientIp, HostName, Username, Database, AppName, SessionId
     ├── RuleResult.cs                   # Sealed record: IsBlocked, Reason; static Allow/Block()
     ├── RuleEngine.cs                   # Bypass check → iterate rules; BypassUsers/AppNames/ClientIps
     ├── SqlInjectionRule.cs             # Dual-layer: 29 regex patterns + AST visitor (tautology, UNION, stacked, WAITFOR, xp_cmdshell)
+    ├── AccessControlRule.cs            # AST: policy-based table/column/operation access control
     ├── UnboundedSelectRule.cs          # AST: blocks SELECT * without WHERE/TOP
     ├── UnboundedDeleteRule.cs          # AST: blocks DELETE without WHERE/TOP
-    └── SsmsMetadataRule.cs             # Regex + HashSet: blocks sys.*, INFORMATION_SCHEMA, 15 metadata procs
+    └── SsmsMetadataRule.cs             # Regex + HashSet: 40+ catalog views, 40+ procs, DMVs, SERVERPROPERTY, app-name filtering
 
 tests/TailSqlProxy.Tests/
 ├── Protocol/
@@ -77,10 +78,11 @@ tests/TailSqlProxy.Tests/
 │   └── SqlBatchMessageTests.cs         # 5 tests — ALL_HEADERS, Unicode, multi-statement
 └── Rules/
     ├── SqlInjectionRuleTests.cs        # 83 tests — all attack types + false-positive avoidance
+    ├── AccessControlRuleTests.cs       # 25 tests — table/column/user/app/IP/DB/priority policies
     ├── RuleEngineBypassTests.cs        # 12 tests — user/app/IP bypass, case sensitivity
     ├── UnboundedSelectRuleTests.cs     # 7 tests — SELECT * blocked/allowed scenarios
     ├── UnboundedDeleteRuleTests.cs     # 5 tests — DELETE blocked/allowed scenarios
-    └── SsmsMetadataRuleTests.cs        # 7 tests — procs, views, schemas, allowlist
+    └── SsmsMetadataRuleTests.cs        # 60 tests — procs, views, DMVs, server props, SET, app-name filter
 ```
 
 ## Key NuGet Packages
@@ -104,7 +106,8 @@ Key sections:
   - `SqlInjection` — Enabled, BlockOnParseErrors, CustomPatterns[]
   - `UnboundedSelect` — Enabled
   - `UnboundedDelete` — Enabled
-  - `SsmsMetadata` — Enabled, BlockedProcedures[], BlockedSystemViews[], BlockedSchemas[], AllowedPatterns[]
+  - `AccessControl` — Enabled, Policies[] (Name, Priority, Action, Users, AppNames, ClientIps, Database, ObjectPattern, Columns, Operations)
+  - `SsmsMetadata` — Enabled, BlockedProcedures[], BlockedSystemViews[], BlockedSchemas[], AllowedPatterns[], BlockedAppNames[], BlockServerProperties, BlockDmvs, BlockSetStatements
 
 ## SQL Firewall Rules
 
@@ -113,7 +116,8 @@ Key sections:
 | **SqlInjection** | AST + 29 regex patterns | Tautologies (OR 1=1), UNION injection, stacked queries (;DROP), time-based (WAITFOR DELAY), xp_cmdshell, sp_OACreate, OPENROWSET, hex encoding, comment evasion, @@version probing |
 | **UnboundedSelect** | AST (TSql170Parser) | SELECT * FROM table without WHERE or TOP |
 | **UnboundedDelete** | AST (TSql170Parser) | DELETE FROM table without WHERE or TOP |
-| **SsmsMetadata** | Regex + HashSet | sys.*, INFORMATION_SCHEMA.*, 15 metadata stored procedures |
+| **AccessControl** | AST (TSql170Parser) | Policy-based table/column/operation access control with user/app/IP/DB scoping, priority ordering |
+| **SsmsMetadata** | Regex + HashSet | 40+ catalog views, 40+ metadata procs, DMVs, SERVERPROPERTY, SET statements, app-name filtering |
 
 **Bypass:** Users/apps/IPs in bypass lists skip all rule evaluation. Bypassed queries are still audit-logged.
 
@@ -140,7 +144,7 @@ Key sections:
 Services:
   Singleton  → CertificateProvider, TlsBridge, TdsProxyServer
   Scoped     → ClientSession (per-connection)
-  Singleton  → SqlInjectionRule, UnboundedSelectRule, UnboundedDeleteRule, SsmsMetadataRule (IQueryRule)
+  Singleton  → SqlInjectionRule, AccessControlRule, UnboundedSelectRule, UnboundedDeleteRule, SsmsMetadataRule (IQueryRule)
   Singleton  → RuleEngine (IRuleEngine)
   Singleton  → AuditLogger (IAuditLogger)
   Hosted     → ProxyHostedService
@@ -148,7 +152,7 @@ Services:
 
 ## Planned Features (DataSunrise-Inspired Roadmap)
 
-- **Phase 2:** Granular access control (column/table/operation-level policies), enhanced audit trail (query duration, row counts, session IDs, JSON format)
+- **Phase 2:** ~~Granular access control (column/table/operation-level policies), enhanced audit trail (query duration, row counts, session IDs, JSON format)~~ ✓ DONE
 - **Phase 3:** Real-time alerting (webhook, email, Syslog), rate limiting (per-user query throttling)
 - **Phase 4:** Dynamic data masking (column-based, role-aware, TDS response rewriting)
 - **Phase 5:** Sensitive data discovery (auto-scan INFORMATION_SCHEMA, PII/PHI pattern matching), query whitelist/learning mode
@@ -162,3 +166,6 @@ Services:
 - `X509CertificateLoader` used instead of obsolete `X509Certificate2` constructor (SYSLIB0057)
 - Audit log SQL truncated to 4000 chars max
 - DONE token detection: 0xFD/0xFE, 13 bytes, checks DONE_MORE bit (0x0001) for response boundary
+- SsmsMetadata rule supports app-name-based blocking (only block from SSMS, allow app queries through)
+- AccessControl uses AST visitor to extract table/column references from SELECT/INSERT/UPDATE/DELETE including JOINs
+- Audit logger writes dual output: rolling text file + structured JSON (CompactJsonFormatter) with session IDs

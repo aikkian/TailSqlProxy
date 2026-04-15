@@ -64,6 +64,22 @@ public class SsmsMetadataOptions
     public string[]? BlockedSystemViews { get; set; }
     public string[]? BlockedSchemas { get; set; }
     public string[]? AllowedPatterns { get; set; }
+
+    /// <summary>
+    /// Block queries only from these app names (case-insensitive).
+    /// If empty/null, metadata is blocked from all apps.
+    /// Typical: ["Microsoft SQL Server Management Studio", "SQLServerCEIP", "azdata"]
+    /// </summary>
+    public string[]? BlockedAppNames { get; set; }
+
+    /// <summary>Block SERVERPROPERTY(), @@VERSION, @@SERVERNAME, etc.</summary>
+    public bool BlockServerProperties { get; set; }
+
+    /// <summary>Block DMVs: sys.dm_exec_*, sys.dm_os_*, sys.dm_db_*, sys.dm_tran_*.</summary>
+    public bool BlockDmvs { get; set; }
+
+    /// <summary>Block SSMS connection-init SET statements (SET NOCOUNT ON, SET TEXTSIZE, etc.).</summary>
+    public bool BlockSetStatements { get; set; }
 }
 
 public class AccessControlOptions

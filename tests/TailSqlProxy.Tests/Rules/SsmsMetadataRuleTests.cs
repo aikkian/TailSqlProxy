@@ -24,15 +24,23 @@ public class SsmsMetadataRuleTests
         _rule = new SsmsMetadataRule(options, NullLogger<SsmsMetadataRule>.Instance);
     }
 
-    private static QueryContext SqlCtx(string sql) => new() { SqlText = sql };
-    private static QueryContext RpcCtx(string procName) => new()
+    private static QueryContext SqlCtx(string sql, string? appName = null) => new()
+    {
+        SqlText = sql,
+        AppName = appName,
+    };
+
+    private static QueryContext RpcCtx(string procName, string? appName = null) => new()
     {
         SqlText = $"EXEC {procName}",
         ProcedureName = procName,
-        IsRpc = true
+        IsRpc = true,
+        AppName = appName,
     };
 
-    // --- BLOCKED SQL QUERIES ---
+    // =============================================
+    // BLOCKED — Core Catalog Views
+    // =============================================
 
     [Theory]
     [InlineData("SELECT * FROM sys.databases")]
@@ -52,11 +60,62 @@ public class SsmsMetadataRuleTests
     [InlineData("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'")]
     public void Blocked_MetadataQueries(string sql)
     {
-        var result = _rule.Evaluate(SqlCtx(sql));
-        result.IsBlocked.Should().BeTrue($"'{sql}' should be blocked as metadata query");
+        _rule.Evaluate(SqlCtx(sql)).IsBlocked.Should().BeTrue($"'{sql}' should be blocked");
     }
 
-    // --- BLOCKED RPC CALLS ---
+    // =============================================
+    // BLOCKED — New Catalog Views (IntelliSense + Object Explorer)
+    // =============================================
+
+    [Theory]
+    [InlineData("SELECT * FROM sys.systypes")]
+    [InlineData("SELECT * FROM sys.synonyms")]
+    [InlineData("SELECT * FROM sys.triggers")]
+    [InlineData("SELECT * FROM sys.computed_columns")]
+    [InlineData("SELECT * FROM sys.identity_columns")]
+    [InlineData("SELECT * FROM sys.sequences")]
+    [InlineData("SELECT * FROM sys.extended_properties WHERE major_id = 123")]
+    [InlineData("SELECT * FROM sys.check_constraints")]
+    [InlineData("SELECT * FROM sys.default_constraints")]
+    [InlineData("SELECT * FROM sys.configurations")]
+    public void Blocked_ExtendedCatalogViews(string sql)
+    {
+        _rule.Evaluate(SqlCtx(sql)).IsBlocked.Should().BeTrue($"'{sql}' should be blocked");
+    }
+
+    // =============================================
+    // BLOCKED — Security Catalog Views
+    // =============================================
+
+    [Theory]
+    [InlineData("SELECT * FROM sys.server_principals")]
+    [InlineData("SELECT * FROM sys.database_principals")]
+    [InlineData("SELECT * FROM sys.database_permissions")]
+    [InlineData("SELECT * FROM sys.server_permissions")]
+    [InlineData("SELECT * FROM sys.database_role_members")]
+    public void Blocked_SecurityCatalogViews(string sql)
+    {
+        _rule.Evaluate(SqlCtx(sql)).IsBlocked.Should().BeTrue($"'{sql}' should be blocked");
+    }
+
+    // =============================================
+    // BLOCKED — Legacy Compatibility Views
+    // =============================================
+
+    [Theory]
+    [InlineData("SELECT * FROM sys.syscolumns")]
+    [InlineData("SELECT * FROM sys.sysobjects")]
+    [InlineData("SELECT * FROM sys.sysindexes")]
+    [InlineData("SELECT * FROM sys.sysusers")]
+    [InlineData("SELECT * FROM sys.sysprocesses")]
+    public void Blocked_LegacyCompatViews(string sql)
+    {
+        _rule.Evaluate(SqlCtx(sql)).IsBlocked.Should().BeTrue($"'{sql}' should be blocked");
+    }
+
+    // =============================================
+    // BLOCKED — Stored Procedures (Original + New)
+    // =============================================
 
     [Theory]
     [InlineData("sp_helpdb")]
@@ -66,13 +125,182 @@ public class SsmsMetadataRuleTests
     [InlineData("sp_help")]
     [InlineData("sp_columns")]
     [InlineData("sp_tables")]
+    // New procedures
+    [InlineData("sp_helptext")]
+    [InlineData("sp_helpindex")]
+    [InlineData("sp_columns_100")]
+    [InlineData("sp_databases")]
+    [InlineData("sp_datatype_info")]
+    [InlineData("sp_datatype_info_100")]
+    [InlineData("sp_describe_parameter_encryption")]
+    [InlineData("sp_special_columns")]
+    [InlineData("sp_helpuser")]
+    [InlineData("sp_helprole")]
+    [InlineData("sp_helprolemember")]
+    [InlineData("sp_helpsrvrolemember")]
     public void Blocked_MetadataProcedures(string procName)
     {
-        var result = _rule.Evaluate(RpcCtx(procName));
-        result.IsBlocked.Should().BeTrue($"RPC '{procName}' should be blocked");
+        _rule.Evaluate(RpcCtx(procName)).IsBlocked.Should().BeTrue($"RPC '{procName}' should be blocked");
     }
 
-    // --- ALLOWED QUERIES ---
+    // =============================================
+    // BLOCKED — Server Properties (when enabled)
+    // =============================================
+
+    [Theory]
+    [InlineData("SELECT SERVERPROPERTY('Edition')")]
+    [InlineData("SELECT SERVERPROPERTY('ProductVersion'), SERVERPROPERTY('ProductLevel')")]
+    [InlineData("SELECT @@SERVERNAME")]
+    [InlineData("SELECT @@SERVICENAME")]
+    [InlineData("SELECT @@SPID")]
+    public void Blocked_ServerProperties_WhenEnabled(string sql)
+    {
+        var options = Options.Create(new RuleOptions
+        {
+            SsmsMetadata = new SsmsMetadataOptions
+            {
+                Enabled = true,
+                BlockServerProperties = true,
+            }
+        });
+        var rule = new SsmsMetadataRule(options, NullLogger<SsmsMetadataRule>.Instance);
+
+        rule.Evaluate(SqlCtx(sql)).IsBlocked.Should().BeTrue($"'{sql}' should be blocked");
+    }
+
+    [Fact]
+    public void Allows_ServerProperties_WhenDisabled()
+    {
+        // Default: BlockServerProperties = false
+        _rule.Evaluate(SqlCtx("SELECT SERVERPROPERTY('Edition')")).IsBlocked.Should().BeFalse();
+    }
+
+    // =============================================
+    // BLOCKED — DMVs (when enabled)
+    // =============================================
+
+    [Theory]
+    [InlineData("SELECT * FROM sys.dm_exec_sessions")]
+    [InlineData("SELECT * FROM sys.dm_exec_connections")]
+    [InlineData("SELECT * FROM sys.dm_os_performance_counters")]
+    [InlineData("SELECT * FROM sys.dm_os_wait_stats")]
+    [InlineData("SELECT * FROM sys.dm_db_index_usage_stats")]
+    [InlineData("SELECT * FROM sys.dm_tran_locks")]
+    public void Blocked_Dmvs_WhenEnabled(string sql)
+    {
+        var options = Options.Create(new RuleOptions
+        {
+            SsmsMetadata = new SsmsMetadataOptions
+            {
+                Enabled = true,
+                BlockDmvs = true,
+            }
+        });
+        var rule = new SsmsMetadataRule(options, NullLogger<SsmsMetadataRule>.Instance);
+
+        rule.Evaluate(SqlCtx(sql)).IsBlocked.Should().BeTrue($"'{sql}' should be blocked");
+    }
+
+    [Fact]
+    public void Allows_Dmvs_WhenDisabled()
+    {
+        // Default: BlockDmvs = false
+        _rule.Evaluate(SqlCtx("SELECT * FROM sys.dm_exec_sessions")).IsBlocked.Should().BeFalse();
+    }
+
+    // =============================================
+    // BLOCKED — SET Statements (when enabled)
+    // =============================================
+
+    [Theory]
+    [InlineData("SET NOCOUNT ON")]
+    [InlineData("SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED")]
+    [InlineData("SET LOCK_TIMEOUT -1")]
+    [InlineData("SET TEXTSIZE 2147483647")]
+    public void Blocked_SetStatements_WhenEnabled(string sql)
+    {
+        var options = Options.Create(new RuleOptions
+        {
+            SsmsMetadata = new SsmsMetadataOptions
+            {
+                Enabled = true,
+                BlockSetStatements = true,
+            }
+        });
+        var rule = new SsmsMetadataRule(options, NullLogger<SsmsMetadataRule>.Instance);
+
+        rule.Evaluate(SqlCtx(sql)).IsBlocked.Should().BeTrue($"'{sql}' should be blocked");
+    }
+
+    [Fact]
+    public void Allows_SetStatements_WhenDisabled()
+    {
+        // Default: BlockSetStatements = false
+        _rule.Evaluate(SqlCtx("SET NOCOUNT ON")).IsBlocked.Should().BeFalse();
+    }
+
+    // =============================================
+    // APP NAME FILTERING
+    // =============================================
+
+    [Fact]
+    public void Blocks_OnlyFromConfiguredAppNames()
+    {
+        var options = Options.Create(new RuleOptions
+        {
+            SsmsMetadata = new SsmsMetadataOptions
+            {
+                Enabled = true,
+                BlockedAppNames = ["Microsoft SQL Server Management Studio"],
+            }
+        });
+        var rule = new SsmsMetadataRule(options, NullLogger<SsmsMetadataRule>.Instance);
+
+        // SSMS app name → blocked
+        rule.Evaluate(SqlCtx("SELECT * FROM sys.tables", appName: "Microsoft SQL Server Management Studio"))
+            .IsBlocked.Should().BeTrue();
+
+        // Different app → allowed
+        rule.Evaluate(SqlCtx("SELECT * FROM sys.tables", appName: "MyWebApp"))
+            .IsBlocked.Should().BeFalse();
+    }
+
+    [Fact]
+    public void AppName_IsCaseInsensitive()
+    {
+        var options = Options.Create(new RuleOptions
+        {
+            SsmsMetadata = new SsmsMetadataOptions
+            {
+                Enabled = true,
+                BlockedAppNames = ["microsoft sql server management studio"],
+            }
+        });
+        var rule = new SsmsMetadataRule(options, NullLogger<SsmsMetadataRule>.Instance);
+
+        rule.Evaluate(SqlCtx("SELECT * FROM sys.tables", appName: "Microsoft SQL Server Management Studio"))
+            .IsBlocked.Should().BeTrue();
+    }
+
+    [Fact]
+    public void NullAppName_NotBlocked_WhenAppFilterConfigured()
+    {
+        var options = Options.Create(new RuleOptions
+        {
+            SsmsMetadata = new SsmsMetadataOptions
+            {
+                Enabled = true,
+                BlockedAppNames = ["Microsoft SQL Server Management Studio"],
+            }
+        });
+        var rule = new SsmsMetadataRule(options, NullLogger<SsmsMetadataRule>.Instance);
+
+        rule.Evaluate(SqlCtx("SELECT * FROM sys.tables")).IsBlocked.Should().BeFalse();
+    }
+
+    // =============================================
+    // ALLOWED — Regular Queries
+    // =============================================
 
     [Theory]
     [InlineData("SELECT * FROM Customers")]
@@ -83,16 +311,14 @@ public class SsmsMetadataRuleTests
     [InlineData("SELECT COUNT(*) FROM Products")]
     public void Allowed_RegularQueries(string sql)
     {
-        var result = _rule.Evaluate(SqlCtx(sql));
-        result.IsBlocked.Should().BeFalse($"'{sql}' should be allowed as regular query");
+        _rule.Evaluate(SqlCtx(sql)).IsBlocked.Should().BeFalse($"'{sql}' should be allowed");
     }
 
     [Fact]
     public void Allowed_AllowlistOverridesBlocklist()
     {
         // sys.dm_exec_requests is in the allowlist
-        var result = _rule.Evaluate(SqlCtx("SELECT * FROM sys.dm_exec_requests"));
-        result.IsBlocked.Should().BeFalse("allowlisted patterns should not be blocked");
+        _rule.Evaluate(SqlCtx("SELECT * FROM sys.dm_exec_requests")).IsBlocked.Should().BeFalse();
     }
 
     [Theory]
@@ -101,15 +327,13 @@ public class SsmsMetadataRuleTests
     [InlineData("my_custom_proc")]
     public void Allowed_NonMetadataProcedures(string procName)
     {
-        var result = _rule.Evaluate(RpcCtx(procName));
-        result.IsBlocked.Should().BeFalse($"RPC '{procName}' should be allowed");
+        _rule.Evaluate(RpcCtx(procName)).IsBlocked.Should().BeFalse($"RPC '{procName}' should be allowed");
     }
 
     [Fact]
     public void Blocked_CaseInsensitive()
     {
-        var result = _rule.Evaluate(SqlCtx("SELECT * FROM SYS.DATABASES"));
-        result.IsBlocked.Should().BeTrue("matching should be case-insensitive");
+        _rule.Evaluate(SqlCtx("SELECT * FROM SYS.DATABASES")).IsBlocked.Should().BeTrue();
     }
 
     [Fact]
@@ -121,7 +345,6 @@ public class SsmsMetadataRuleTests
         });
         var rule = new SsmsMetadataRule(options, NullLogger<SsmsMetadataRule>.Instance);
 
-        var result = rule.Evaluate(SqlCtx("SELECT * FROM sys.databases"));
-        result.IsBlocked.Should().BeFalse("disabled rule should not block");
+        rule.Evaluate(SqlCtx("SELECT * FROM sys.databases")).IsBlocked.Should().BeFalse();
     }
 }

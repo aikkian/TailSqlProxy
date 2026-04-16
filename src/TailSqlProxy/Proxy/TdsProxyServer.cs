@@ -16,6 +16,7 @@ public class TdsProxyServer
     private readonly ILogger<TdsProxyServer> _logger;
     private TcpListener? _listener;
     private int _activeConnections;
+    private readonly HashSet<string> _allowedClientIps;
 
     public TdsProxyServer(
         IOptions<ProxyOptions> options,
@@ -27,6 +28,8 @@ public class TdsProxyServer
         _serviceProvider = serviceProvider;
         _metrics = metrics;
         _logger = logger;
+        _allowedClientIps = new HashSet<string>(
+            _options.AllowedClientIps ?? [], StringComparer.Ordinal);
     }
 
     public async Task StartAsync(CancellationToken ct)
@@ -44,7 +47,17 @@ public class TdsProxyServer
             {
                 var client = await _listener.AcceptTcpClientAsync(ct);
                 var clientEndpoint = client.Client.RemoteEndPoint as IPEndPoint;
-                _logger.LogInformation("New connection from {ClientIp}", clientEndpoint?.Address);
+                var clientIp = clientEndpoint?.Address.ToString();
+                _logger.LogInformation("New connection from {ClientIp}", clientIp);
+
+                // IP whitelist check: if AllowedClientIps is non-empty, reject unlisted IPs
+                if (_allowedClientIps.Count > 0 && (clientIp == null || !_allowedClientIps.Contains(clientIp)))
+                {
+                    _metrics.RecordRejectedConnection();
+                    _logger.LogWarning("Connection rejected: IP {ClientIp} is not in the whitelist", clientIp);
+                    client.Close();
+                    continue;
+                }
 
                 // Atomic increment-and-check: increment first, then rollback if over limit
                 var count = Interlocked.Increment(ref _activeConnections);

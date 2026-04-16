@@ -4,27 +4,30 @@
 
 TDS (Tabular Data Stream) protocol proxy for Azure SQL Database. Sits between SQL clients (SSMS, applications) and Azure SQL to monitor, audit, and control all SQL traffic. Inspired by DataSunrise's database security approach.
 
-**Target:** .NET 10.0 | **Tests:** 329 (xUnit + FluentAssertions) | **Solution:** `TailSqlProxy.sln`
+**Target:** .NET 10.0 | **Tests:** 431 (xUnit + FluentAssertions) | **Solution:** `TailSqlProxy.sln`
 
 ## Quick Commands
 
 ```bash
 dotnet build                  # Build solution
-dotnet test                   # Run all 292 tests
+dotnet test                   # Run all 431 tests
 dotnet run --project src/TailSqlProxy  # Run proxy
 ```
 
 ## Architecture
 
 ```
-Client (SSMS/App) → [TLS] → TailSqlProxy → [TLS] → Azure SQL Database
-                              ↓
+Client (SSMS/App) → [TLS] → TailSqlProxy ──┬──→ [TLS] → Azure SQL Primary (read-write)
+                              ↓              └──→ [TLS] → Azure SQL Replica (read-only)
                      Rule Engine (inspect & block)
+                              ↓
+                     Read/Write Router (classify & route)
                               ↓
                      Audit Logger (Serilog + Datadog)
 ```
 
 **Connection flow:** TCP Accept → TLS MITM → PreLogin → Login7 (extract user/db/app) → Bidirectional Relay (MARS)
+**Read/Write Split:** SELECT-only queries → read-only replica (ApplicationIntent=ReadOnly); DML/transactions → primary
 
 ## Project Structure
 
@@ -36,7 +39,8 @@ src/TailSqlProxy/
 │   ├── ProxyOptions.cs                 # Proxy, cert, Datadog config
 │   ├── RuleOptions.cs                  # Rule toggles, bypass lists, SQL injection options, UnboundedQueryMode enum, QueryTimeoutOptions
 │   ├── TargetServerOptions.cs          # Target Azure SQL host/port
-│   └── MetricsOptions.cs              # Prometheus metrics, slow query threshold, histogram buckets
+│   ├── MetricsOptions.cs              # Prometheus metrics, slow query threshold, histogram buckets
+│   └── ReadWriteSplitOptions.cs       # Read/write split routing config (replica host, app-name overrides)
 ├── Hosting/
 │   └── ProxyHostedService.cs           # BackgroundService wrapper
 ├── Logging/
@@ -62,9 +66,14 @@ src/TailSqlProxy/
 │   └── MetricsHostedService.cs         # HTTP /metrics endpoint for Prometheus scraping
 ├── Proxy/
 │   ├── TdsProxyServer.cs               # TCP listener, atomic connection limit, connection metrics
-│   ├── ClientSession.cs                # Bidirectional relay, query duration tracking, DONE token parsing, timeout enforcement via TDS Attention
+│   ├── ClientSession.cs                # Bidirectional relay, query duration tracking, DONE token parsing, timeout enforcement via TDS Attention, read/write split routing
 │   ├── TlsBridge.cs                    # TLS MITM (TDS 8.0 + 7.x), TdsPreLoginWrapperStream
 │   └── CertificateProvider.cs          # Lazy<T> thread-safe cert, auto-gen self-signed RSA-2048
+├── Routing/
+│   ├── QueryClassifier.cs              # AST-based read-only query detection (TSql170Parser)
+│   ├── TransactionTracker.cs           # Tracks BEGIN/COMMIT/ROLLBACK across session
+│   ├── Login7Modifier.cs               # Sets ApplicationIntent=ReadOnly in Login7 TypeFlags
+│   └── ReadWriteRouter.cs              # Per-query routing: read-only replica vs primary, app-name overrides
 └── Rules/
     ├── IQueryRule.cs                   # Interface: Name, IsEnabled, Evaluate(QueryContext)
     ├── IRuleEngine.cs                  # Interface: Evaluate(QueryContext) → RuleResult
@@ -85,6 +94,11 @@ tests/TailSqlProxy.Tests/
 │   ├── TdsPacketHeaderTests.cs         # 7 tests — header parsing, big-endian, round-trip
 │   ├── TdsMessageReaderTests.cs        # 5 tests — single/multi-packet, empty stream
 │   └── SqlBatchMessageTests.cs         # 5 tests — ALL_HEADERS, Unicode, multi-statement
+├── Routing/
+│   ├── QueryClassifierTests.cs         # 36 tests — read-only/write classification, SELECT INTO, transactions, edge cases
+│   ├── TransactionTrackerTests.cs      # 12 tests — BEGIN/COMMIT/ROLLBACK, nesting, savepoints, reset
+│   ├── Login7ModifierTests.cs          # 7 tests — ReadOnly intent bit, idempotency, short payload
+│   └── ReadWriteRouterTests.cs         # 27 tests — SQL batch/RPC routing, transactions, app-name overrides, config
 └── Rules/
     ├── SqlInjectionRuleTests.cs        # 83 tests — all attack types + false-positive avoidance
     ├── AccessControlRuleTests.cs       # 25 tests — table/column/user/app/IP/DB/priority policies
@@ -113,6 +127,7 @@ tests/TailSqlProxy.Tests/
 Key sections:
 - **`Proxy`** — ListenPort (1433), ListenAddress, MaxConcurrentConnections (100), Certificate (AutoGenerate), AuditLogPath, Datadog
 - **`TargetServer`** — Host (Azure SQL FQDN), Port
+- **`ReadWriteSplit`** — Enabled, ReadOnlyHost, ReadOnlyPort (1433), AlwaysPrimaryAppNames[], AlwaysReadOnlyAppNames[]
 - **`Rules`** — BypassUsers[], BypassAppNames[], BypassClientIps[]
   - `SqlInjection` — Enabled, BlockOnParseErrors, CustomPatterns[]
   - `UnboundedSelect` — Enabled, Mode (Block|Timeout), TimeoutMs (default 300000 = 5 min)
@@ -155,8 +170,9 @@ Key sections:
 
 ```
 Services:
+  Config     → ProxyOptions, TargetServerOptions, RuleOptions, MetricsOptions, ReadWriteSplitOptions
   Singleton  → CertificateProvider, TlsBridge, TdsProxyServer
-  Scoped     → ClientSession (per-connection)
+  Scoped     → ClientSession (per-connection, creates ReadWriteRouter per session)
   Singleton  → SqlInjectionRule, AccessControlRule, UnboundedSelectRule, UnboundedDeleteRule, SsmsMetadataRule (IQueryRule)
   Singleton  → RuleEngine (IRuleEngine)
   Singleton  → AuditLogger (IAuditLogger)
@@ -173,6 +189,7 @@ Services:
 - **Phase 5:** Sensitive data discovery (auto-scan INFORMATION_SCHEMA, PII/PHI pattern matching), query whitelist/learning mode
 - **Phase 6:** ~~Query performance monitoring (slow query detection, Prometheus metrics)~~ ✓ DONE — management REST API (deferred)
 - **Phase 7:** ~~Query timeout enforcement (unbounded query timeout mode, TDS Attention signal, global query timeout)~~ ✓ DONE
+- **Phase 8:** ~~Read/write split routing (ApplicationIntent=ReadOnly, AST-based query classification, transaction tracking, dual upstream connections)~~ ✓ DONE
 
 ## Development Notes
 
@@ -194,3 +211,11 @@ Services:
 - UnboundedSelect/Delete rules support Mode=Block (reject immediately) or Mode=Timeout (allow but kill after TimeoutMs)
 - RuleEngine picks tightest (smallest) timeout when multiple rules return AllowWithTimeout; falls back to global QueryTimeout
 - Timeout polling: server→client relay uses 500ms read timeout to check for timeout CTS cancellation
+- Read/write split: dual upstream connections per session — primary (read-write) and read-only replica (ApplicationIntent=ReadOnly)
+- QueryClassifier uses TSql170Parser AST to detect read-only queries (SELECT, SET, DECLARE, PRINT, USE); routes DML/DDL/EXEC/transactions to primary
+- TransactionTracker tracks BEGIN/COMMIT/ROLLBACK depth across the session; any active transaction forces primary routing
+- Login7Modifier sets bit 5 (0x20) of TypeFlags at offset 32 to enable ApplicationIntent=ReadOnly on the replica connection
+- Read-only replica connection is lazy — established on first read-only query, not at login time
+- App-name overrides: AlwaysPrimaryAppNames (e.g., migration tools) and AlwaysReadOnlyAppNames (e.g., PowerBI, reporting)
+- SELECT INTO detected via SelectStatement.Into property — routes to primary despite being SELECT syntax
+- EXEC/stored procedures always route to primary since side effects cannot be statically determined

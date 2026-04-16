@@ -50,6 +50,7 @@ builder.Services.Configure<ProxyOptions>(builder.Configuration.GetSection("Proxy
 builder.Services.Configure<TargetServerOptions>(builder.Configuration.GetSection("TargetServer"));
 builder.Services.Configure<RuleOptions>(builder.Configuration.GetSection("Rules"));
 builder.Services.Configure<MetricsOptions>(builder.Configuration.GetSection("Metrics"));
+builder.Services.Configure<ReadWriteSplitOptions>(builder.Configuration.GetSection("ReadWriteSplit"));
 
 // Proxy infrastructure
 builder.Services.AddSingleton<CertificateProvider>();

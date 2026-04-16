@@ -9,6 +9,7 @@ using TailSqlProxy.Logging;
 using TailSqlProxy.Monitoring;
 using TailSqlProxy.Protocol;
 using TailSqlProxy.Protocol.Messages;
+using TailSqlProxy.Routing;
 using TailSqlProxy.Rules;
 
 namespace TailSqlProxy.Proxy;
@@ -18,12 +19,14 @@ public class ClientSession : IDisposable
     private readonly TargetServerOptions _targetOptions;
     private readonly ProxyOptions _proxyOptions;
     private readonly MetricsOptions _metricsOptions;
+    private readonly ReadWriteSplitOptions _rwSplitOptions;
     private readonly TlsBridge _tlsBridge;
     private readonly IRuleEngine _ruleEngine;
     private readonly IAuditLogger _auditLogger;
     private readonly IProxyMetrics _metrics;
     private readonly ILogger<ClientSession> _logger;
 
+    // Primary (read-write) connection
     private TcpClient? _serverConnection;
     private Stream? _clientStream;
     private Stream? _serverStream;
@@ -31,6 +34,19 @@ public class ClientSession : IDisposable
     private TdsMessageWriter? _clientWriter;
     private TdsMessageReader? _serverReader;
     private TdsMessageWriter? _serverWriter;
+
+    // Read-only replica connection (lazy — established on first read-only query)
+    private TcpClient? _readOnlyConnection;
+    private Stream? _readOnlyStream;
+    private TdsMessageReader? _readOnlyReader;
+    private TdsMessageWriter? _readOnlyWriter;
+    private readonly SemaphoreSlim _readOnlyWriteLock = new(1, 1);
+    private bool _readOnlyConnected;
+
+    // Read/write routing
+    private ReadWriteRouter? _router;
+    // Tracks which server the current pending query was sent to
+    private volatile RouteTarget _lastQueryTarget = RouteTarget.Primary;
 
     // Write locks to prevent interleaved packet writes from concurrent tasks
     private readonly SemaphoreSlim _clientWriteLock = new(1, 1);
@@ -43,6 +59,9 @@ public class ClientSession : IDisposable
     private string? _username;
     private string? _database;
     private string? _appName;
+
+    // Original Login7 payload (captured for read-only replica replay)
+    private byte[]? _originalLogin7Payload;
 
     // Pending queries awaiting server response (for duration tracking)
     private readonly ConcurrentQueue<QueryContext> _pendingQueries = new();
@@ -61,6 +80,7 @@ public class ClientSession : IDisposable
         IOptions<TargetServerOptions> targetOptions,
         IOptions<ProxyOptions> proxyOptions,
         IOptions<MetricsOptions> metricsOptions,
+        IOptions<ReadWriteSplitOptions> rwSplitOptions,
         TlsBridge tlsBridge,
         IRuleEngine ruleEngine,
         IAuditLogger auditLogger,
@@ -70,6 +90,7 @@ public class ClientSession : IDisposable
         _targetOptions = targetOptions.Value;
         _proxyOptions = proxyOptions.Value;
         _metricsOptions = metricsOptions.Value;
+        _rwSplitOptions = rwSplitOptions.Value;
         _tlsBridge = tlsBridge;
         _ruleEngine = ruleEngine;
         _auditLogger = auditLogger;
@@ -155,6 +176,15 @@ public class ClientSession : IDisposable
             await HandleLogin7Async(ct);
 
             _auditLogger.LogConnection(_clientIp, _username, _database, _appName, _sessionId);
+
+            // Initialize read/write split router if enabled
+            if (_rwSplitOptions.Enabled)
+            {
+                _router = new ReadWriteRouter(_rwSplitOptions, _logger);
+                _logger.LogInformation(
+                    "Read/write split enabled for session {SessionId} | User={Username} | App={AppName}",
+                    _sessionId, _username, _appName);
+            }
 
             // Bidirectional relay — two concurrent tasks for MARS support
             await RunBidirectionalRelayAsync(ct);
@@ -300,13 +330,18 @@ public class ClientSession : IDisposable
                 await OnQueryTimeoutAsync(ct);
             }
 
+            // Read from whichever server the last query was sent to
+            var activeReader = (_lastQueryTarget == RouteTarget.ReadOnly && _readOnlyReader != null)
+                ? _readOnlyReader
+                : _serverReader!;
+
             TdsPacket? packet;
             try
             {
                 // Use a short read timeout so we can periodically check the query timeout CTS
                 using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 readCts.CancelAfter(TimeSpan.FromMilliseconds(500));
-                packet = await _serverReader!.ReadPacketAsync(readCts.Token);
+                packet = await activeReader.ReadPacketAsync(readCts.Token);
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             {
@@ -316,7 +351,7 @@ public class ClientSession : IDisposable
 
             if (packet == null)
             {
-                _logger.LogDebug("Server disconnected");
+                _logger.LogDebug("Server disconnected (target={Target})", _lastQueryTarget);
                 break;
             }
 
@@ -380,14 +415,18 @@ public class ClientSession : IDisposable
             window: 0);
         header.WriteTo(attentionPacket);
 
-        await _serverWriteLock.WaitAsync(ct);
-        try
+        // Send Attention to whichever server the query was routed to
+        if (_lastQueryTarget == RouteTarget.ReadOnly && _readOnlyWriter != null)
         {
-            await _serverWriter!.WriteRawAsync(attentionPacket, ct);
+            await _readOnlyWriteLock.WaitAsync(ct);
+            try { await _readOnlyWriter.WriteRawAsync(attentionPacket, ct); }
+            finally { _readOnlyWriteLock.Release(); }
         }
-        finally
+        else
         {
-            _serverWriteLock.Release();
+            await _serverWriteLock.WaitAsync(ct);
+            try { await _serverWriter!.WriteRawAsync(attentionPacket, ct); }
+            finally { _serverWriteLock.Release(); }
         }
     }
 
@@ -479,6 +518,22 @@ public class ClientSession : IDisposable
         _auditLogger.LogQuery(context);
         _pendingQueries.Enqueue(context);
         StartQueryTimeout(result, context);
+
+        // Route to primary or read-only replica
+        var target = _router?.RouteSqlBatch(sqlText, _appName) ?? RouteTarget.Primary;
+        if (target == RouteTarget.ReadOnly)
+        {
+            await EnsureReadOnlyConnectionAsync(ct);
+            if (_readOnlyConnected)
+            {
+                _lastQueryTarget = RouteTarget.ReadOnly;
+                await WriteToReadOnlyServerAsync(message, ct);
+                return;
+            }
+            // Fall through to primary if read-only connection failed
+        }
+
+        _lastQueryTarget = RouteTarget.Primary;
         await WriteToServerAsync(message, ct);
     }
 
@@ -502,6 +557,21 @@ public class ClientSession : IDisposable
         _auditLogger.LogQuery(context);
         _pendingQueries.Enqueue(context);
         StartQueryTimeout(result, context);
+
+        // Route to primary or read-only replica
+        var target = _router?.RouteRpc(procName, sqlText, _appName) ?? RouteTarget.Primary;
+        if (target == RouteTarget.ReadOnly)
+        {
+            await EnsureReadOnlyConnectionAsync(ct);
+            if (_readOnlyConnected)
+            {
+                _lastQueryTarget = RouteTarget.ReadOnly;
+                await WriteToReadOnlyServerAsync(message, ct);
+                return;
+            }
+        }
+
+        _lastQueryTarget = RouteTarget.Primary;
         await WriteToServerAsync(message, ct);
     }
 
@@ -533,6 +603,119 @@ public class ClientSession : IDisposable
         _queryTimeoutCts?.Dispose();
         _queryTimeoutCts = null;
         _timeoutQueryContext = null;
+    }
+
+    /// <summary>
+    /// Lazily establishes the read-only replica connection on first use.
+    /// Connects to the read-only host (or same host with ApplicationIntent=ReadOnly),
+    /// performs the full TDS handshake (PreLogin + TLS + Login7 with ReadOnly intent).
+    /// </summary>
+    private async Task EnsureReadOnlyConnectionAsync(CancellationToken ct)
+    {
+        if (_readOnlyConnected)
+            return;
+
+        var roHost = !string.IsNullOrWhiteSpace(_rwSplitOptions.ReadOnlyHost)
+            ? _rwSplitOptions.ReadOnlyHost
+            : _targetOptions.Host;
+        var roPort = _rwSplitOptions.ReadOnlyPort;
+
+        _logger.LogInformation(
+            "Establishing read-only replica connection to {Host}:{Port} | Session={SessionId}",
+            roHost, roPort, _sessionId);
+
+        _readOnlyConnection = new TcpClient { NoDelay = true };
+        await _readOnlyConnection.ConnectAsync(roHost, roPort, ct);
+
+        var roNetStream = _readOnlyConnection.GetStream();
+
+        // Send PreLogin to read-only server
+        var preLoginPacket = BuildPreLoginPacket();
+        await roNetStream.WriteAsync(preLoginPacket, ct);
+        await roNetStream.FlushAsync(ct);
+
+        var rawRoReader = new TdsMessageReader(roNetStream);
+        var serverPreLogin = await rawRoReader.ReadMessageAsync(ct);
+        if (serverPreLogin == null)
+            throw new InvalidOperationException("Read-only server disconnected during PreLogin.");
+
+        // Establish TLS with the read-only server
+        _readOnlyStream = await _tlsBridge.EstablishServerTds7TlsAsync(roNetStream, roHost, ct);
+        _readOnlyReader = new TdsMessageReader(_readOnlyStream);
+        _readOnlyWriter = new TdsMessageWriter(_readOnlyStream);
+
+        // Build Login7 with ApplicationIntent=ReadOnly and send it
+        await SendReadOnlyLogin7Async(ct);
+
+        _readOnlyConnected = true;
+        _logger.LogInformation("Read-only replica connection established | Session={SessionId}", _sessionId);
+    }
+
+    /// <summary>
+    /// Constructs and sends a Login7 with ApplicationIntent=ReadOnly to the read-only server.
+    /// Replays the same credentials/database/app as the primary connection.
+    /// </summary>
+    private async Task SendReadOnlyLogin7Async(CancellationToken ct)
+    {
+        // Build a minimal Login7 payload with the same identity fields
+        var roHost = !string.IsNullOrWhiteSpace(_rwSplitOptions.ReadOnlyHost)
+            ? _rwSplitOptions.ReadOnlyHost
+            : _targetOptions.Host;
+
+        // We stored the original Login7 message for replay
+        if (_originalLogin7Payload == null)
+            throw new InvalidOperationException("Original Login7 payload not captured for read-only replay.");
+
+        // Clone the original Login7 and set ApplicationIntent=ReadOnly
+        var roPayload = Login7Modifier.SetReadOnlyIntent(_originalLogin7Payload);
+
+        // Rewrite server name to match the read-only host
+        var roLoginMessage = RebuildLogin7Message(roPayload);
+        roLoginMessage = RewriteLogin7ServerName(roLoginMessage, roHost);
+
+        // Send Login7 to read-only server
+        foreach (var packet in roLoginMessage.Packets)
+            await _readOnlyWriter!.WriteRawAsync(packet.RawBytes, ct);
+
+        // Read and discard login response from read-only server
+        // (we don't forward this to the client — it's an internal connection)
+        bool moreExpected = await ConsumeLoginResponseAsync(_readOnlyReader!, ct);
+
+        while (moreExpected)
+        {
+            // If FedAuth is needed, we cannot replay it to a second server.
+            // Fall back to disabling read-only for this session.
+            _logger.LogWarning(
+                "Read-only server requires FedAuth handshake — disabling read/write split for this session");
+            _readOnlyConnected = false;
+            if (_router != null)
+                _router = null; // Disable routing
+            return;
+        }
+    }
+
+    /// <summary>
+    /// Reads and discards a login response from a server connection.
+    /// Returns true if DONE_MORE (server expects further input).
+    /// </summary>
+    private async Task<bool> ConsumeLoginResponseAsync(TdsMessageReader reader, CancellationToken ct)
+    {
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(ResponseTimeout);
+
+        while (true)
+        {
+            var packet = await reader.ReadPacketAsync(timeoutCts.Token);
+            if (packet == null)
+                return false;
+
+            if (packet.Header.IsEndOfMessage && packet.Header.Type == TdsPacketType.TabularResult)
+            {
+                if (TryExtractDoneInfo(packet.Payload, out _, out bool isFinal) && isFinal)
+                    return false;
+                return true; // DONE_MORE
+            }
+        }
     }
 
     /// <summary>
@@ -679,6 +862,23 @@ public class ClientSession : IDisposable
         }
     }
 
+    private async Task WriteToReadOnlyServerAsync(TdsMessage message, CancellationToken ct)
+    {
+        await _readOnlyWriteLock.WaitAsync(ct);
+        try
+        {
+            foreach (var packet in message.Packets)
+            {
+                _metrics.RecordBytesRelayed(packet.RawBytes.Length, "client_to_server");
+                await _readOnlyWriter!.WriteRawAsync(packet.RawBytes, ct);
+            }
+        }
+        finally
+        {
+            _readOnlyWriteLock.Release();
+        }
+    }
+
     private async Task WriteToClientRawAsync(ReadOnlyMemory<byte> data, CancellationToken ct)
     {
         await _clientWriteLock.WaitAsync(ct);
@@ -736,6 +936,9 @@ public class ClientSession : IDisposable
 
         if (loginMessage.Type == TdsPacketType.Login7)
         {
+            // Capture original payload for read-only replica replay
+            _originalLogin7Payload = loginMessage.Payload.ToArray();
+
             var login = new Login7Message(loginMessage);
             _username = login.ExtractUsername();
             _database = login.ExtractDatabase();
@@ -833,8 +1036,11 @@ public class ClientSession : IDisposable
         _queryTimeoutCts?.Dispose();
         _clientWriteLock.Dispose();
         _serverWriteLock.Dispose();
+        _readOnlyWriteLock.Dispose();
         _clientStream?.Dispose();
         _serverStream?.Dispose();
         _serverConnection?.Dispose();
+        _readOnlyStream?.Dispose();
+        _readOnlyConnection?.Dispose();
     }
 }

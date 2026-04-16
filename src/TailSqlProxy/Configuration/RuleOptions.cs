@@ -7,6 +7,7 @@ public class RuleOptions
     public SsmsMetadataOptions? SsmsMetadata { get; set; }
     public SqlInjectionOptions? SqlInjection { get; set; }
     public AccessControlOptions? AccessControl { get; set; }
+    public QueryTimeoutOptions? QueryTimeout { get; set; }
 
     /// <summary>
     /// Users in this list bypass all query blocking rules.
@@ -32,11 +33,47 @@ public class RuleOptions
 public class UnboundedSelectOptions
 {
     public bool Enabled { get; set; } = true;
+
+    /// <summary>
+    /// Block = reject immediately (default). Timeout = allow but kill after TimeoutMs.
+    /// </summary>
+    public UnboundedQueryMode Mode { get; set; } = UnboundedQueryMode.Block;
+
+    /// <summary>Timeout in milliseconds when Mode is Timeout. Default: 5 minutes.</summary>
+    public double TimeoutMs { get; set; } = 300_000;
 }
 
 public class UnboundedDeleteOptions
 {
     public bool Enabled { get; set; } = true;
+
+    /// <summary>
+    /// Block = reject immediately (default). Timeout = allow but kill after TimeoutMs.
+    /// </summary>
+    public UnboundedQueryMode Mode { get; set; } = UnboundedQueryMode.Block;
+
+    /// <summary>Timeout in milliseconds when Mode is Timeout. Default: 5 minutes.</summary>
+    public double TimeoutMs { get; set; } = 300_000;
+}
+
+/// <summary>
+/// Global query timeout enforcement. Applies a default timeout to all queries
+/// unless overridden by rule-specific timeouts.
+/// </summary>
+public class QueryTimeoutOptions
+{
+    public bool Enabled { get; set; }
+
+    /// <summary>Default timeout for all queries (ms). 0 = no default timeout.</summary>
+    public double DefaultTimeoutMs { get; set; }
+}
+
+public enum UnboundedQueryMode
+{
+    /// <summary>Reject unbounded queries immediately with an error.</summary>
+    Block,
+    /// <summary>Allow unbounded queries but kill them if they exceed the timeout.</summary>
+    Timeout,
 }
 
 public class SqlInjectionOptions

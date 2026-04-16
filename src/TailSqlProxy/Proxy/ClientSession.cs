@@ -1,10 +1,12 @@
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using TailSqlProxy.Configuration;
 using TailSqlProxy.Logging;
+using TailSqlProxy.Monitoring;
 using TailSqlProxy.Protocol;
 using TailSqlProxy.Protocol.Messages;
 using TailSqlProxy.Rules;
@@ -15,9 +17,11 @@ public class ClientSession : IDisposable
 {
     private readonly TargetServerOptions _targetOptions;
     private readonly ProxyOptions _proxyOptions;
+    private readonly MetricsOptions _metricsOptions;
     private readonly TlsBridge _tlsBridge;
     private readonly IRuleEngine _ruleEngine;
     private readonly IAuditLogger _auditLogger;
+    private readonly IProxyMetrics _metrics;
     private readonly ILogger<ClientSession> _logger;
 
     private TcpClient? _serverConnection;
@@ -40,22 +44,36 @@ public class ClientSession : IDisposable
     private string? _database;
     private string? _appName;
 
+    // Pending queries awaiting server response (for duration tracking)
+    private readonly ConcurrentQueue<QueryContext> _pendingQueries = new();
+
+    // Active query timeout: CTS that fires when the current query exceeds its allowed duration.
+    // Set in HandleSqlBatchAsync/HandleRpcAsync when rule returns AllowWithTimeout.
+    // Checked in RelayServerToClientAsync; fires SendAttentionAsync to kill the query.
+    private CancellationTokenSource? _queryTimeoutCts;
+    private QueryContext? _timeoutQueryContext;
+    private double _activeTimeoutMs;
+
     // Timeout for response forwarding (prevents hung connections)
     private static readonly TimeSpan ResponseTimeout = TimeSpan.FromMinutes(5);
 
     public ClientSession(
         IOptions<TargetServerOptions> targetOptions,
         IOptions<ProxyOptions> proxyOptions,
+        IOptions<MetricsOptions> metricsOptions,
         TlsBridge tlsBridge,
         IRuleEngine ruleEngine,
         IAuditLogger auditLogger,
+        IProxyMetrics metrics,
         ILogger<ClientSession> logger)
     {
         _targetOptions = targetOptions.Value;
         _proxyOptions = proxyOptions.Value;
+        _metricsOptions = metricsOptions.Value;
         _tlsBridge = tlsBridge;
         _ruleEngine = ruleEngine;
         _auditLogger = auditLogger;
+        _metrics = metrics;
         _logger = logger;
     }
 
@@ -269,20 +287,177 @@ public class ClientSession : IDisposable
     /// Server→Client relay: reads raw TDS packets from server and forwards to client.
     /// Runs independently of the client→server direction.
     /// All server responses (result sets, errors, DONE tokens) flow through here.
+    /// Detects query completion via DONE tokens and records duration metrics.
+    /// Monitors query timeouts and sends Attention signals to cancel long-running queries.
     /// </summary>
     private async Task RelayServerToClientAsync(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
         {
-            var packet = await _serverReader!.ReadPacketAsync(ct);
+            // Check if query timeout has fired — send Attention to cancel on server
+            if (_queryTimeoutCts is { IsCancellationRequested: true })
+            {
+                await OnQueryTimeoutAsync(ct);
+            }
+
+            TdsPacket? packet;
+            try
+            {
+                // Use a short read timeout so we can periodically check the query timeout CTS
+                using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                readCts.CancelAfter(TimeSpan.FromMilliseconds(500));
+                packet = await _serverReader!.ReadPacketAsync(readCts.Token);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                // Read timed out (500ms polling interval) — loop back to check timeout CTS
+                continue;
+            }
+
             if (packet == null)
             {
                 _logger.LogDebug("Server disconnected");
                 break;
             }
 
+            _metrics.RecordBytesRelayed(packet.RawBytes.Length, "server_to_client");
             await WriteToClientRawAsync(packet.RawBytes, ct);
+
+            // Detect query completion: final DONE token in a TabularResult EOM packet
+            if (packet.Header.IsEndOfMessage && packet.Header.Type == TdsPacketType.TabularResult)
+            {
+                if (TryExtractDoneInfo(packet.Payload, out long rowCount, out bool isFinal) && isFinal)
+                {
+                    CancelQueryTimeout();
+                    OnQueryCompleted(rowCount);
+                }
+            }
         }
+    }
+
+    /// <summary>
+    /// Sends a TDS Attention signal (0x06) to the server to cancel the currently executing query.
+    /// Called when a query exceeds its allowed timeout duration.
+    /// </summary>
+    private async Task OnQueryTimeoutAsync(CancellationToken ct)
+    {
+        var context = _timeoutQueryContext;
+        var timeoutMs = _activeTimeoutMs;
+        CancelQueryTimeout();
+
+        if (context != null)
+        {
+            context.DurationMs = context.StartTimeUtc.HasValue
+                ? (DateTime.UtcNow - context.StartTimeUtc.Value).TotalMilliseconds
+                : timeoutMs;
+
+            _auditLogger.LogTimeoutKilled(context, timeoutMs);
+            _metrics.RecordTimeoutKilled(_username, _database);
+            _logger.LogWarning(
+                "Query timeout exceeded ({TimeoutMs}ms) — sending Attention to cancel | User={Username} | SQL={Sql}",
+                timeoutMs, _username,
+                context.SqlText.Length > 200 ? context.SqlText[..200] + "..." : context.SqlText);
+        }
+
+        await SendAttentionAsync(ct);
+    }
+
+    /// <summary>
+    /// Sends a TDS Attention packet (type 0x06) to the server.
+    /// This is the TDS protocol mechanism to cancel a running query.
+    /// The server will respond with a DONE token with the DONE_ATTN (0x0020) status bit.
+    /// </summary>
+    private async Task SendAttentionAsync(CancellationToken ct)
+    {
+        // Attention packet: 8-byte TDS header with type=0x06, status=EOM, length=8, no payload
+        var attentionPacket = new byte[TdsPacketHeader.Size];
+        var header = new TdsPacketHeader(
+            type: TdsPacketType.Attention,
+            status: (byte)TdsStatusBits.EndOfMessage,
+            length: TdsPacketHeader.Size,
+            spid: 0,
+            packetId: 1,
+            window: 0);
+        header.WriteTo(attentionPacket);
+
+        await _serverWriteLock.WaitAsync(ct);
+        try
+        {
+            await _serverWriter!.WriteRawAsync(attentionPacket, ct);
+        }
+        finally
+        {
+            _serverWriteLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Called when a query response is complete. Calculates duration, records metrics,
+    /// and logs slow queries.
+    /// </summary>
+    private void OnQueryCompleted(long rowCount)
+    {
+        if (!_pendingQueries.TryDequeue(out var context))
+            return;
+
+        if (context.StartTimeUtc.HasValue)
+        {
+            context.DurationMs = (DateTime.UtcNow - context.StartTimeUtc.Value).TotalMilliseconds;
+            context.RowCount = rowCount;
+
+            var durationSeconds = context.DurationMs.Value / 1000.0;
+            _metrics.RecordQuery(_username, _database, _appName, durationSeconds);
+
+            if (context.DurationMs.Value >= _metricsOptions.SlowQueryThresholdMs)
+            {
+                _metrics.RecordSlowQuery(_username, _database, durationSeconds);
+                _auditLogger.LogSlowQuery(context);
+                _logger.LogWarning(
+                    "Slow query detected: {DurationMs:F1}ms | User={Username} | DB={Database} | SQL={Sql}",
+                    context.DurationMs.Value, _username, _database,
+                    context.SqlText.Length > 200 ? context.SqlText[..200] + "..." : context.SqlText);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Attempts to extract row count and final status from a DONE/DONEPROC token
+    /// in the packet payload.
+    /// </summary>
+    private static bool TryExtractDoneInfo(byte[] payload, out long rowCount, out bool isFinal)
+    {
+        rowCount = 0;
+        isFinal = false;
+
+        const int doneTokenSize = 13; // 1 (type) + 2 (status) + 2 (curcmd) + 8 (rowcount)
+
+        if (payload.Length < doneTokenSize)
+            return false;
+
+        // Scan backwards for the last DONE/DONEPROC token
+        int offset = -1;
+        for (int i = payload.Length - doneTokenSize; i >= 0; i--)
+        {
+            if (payload[i] is 0xFD or 0xFE) // DONE or DONEPROC
+            {
+                offset = i;
+                break;
+            }
+        }
+
+        if (offset < 0 || offset + doneTokenSize > payload.Length)
+            return false;
+
+        ushort status = BinaryPrimitives.ReadUInt16LittleEndian(payload.AsSpan(offset + 1, 2));
+        isFinal = (status & 0x0001) == 0; // DONE_MORE bit not set = final
+
+        // Extract row count if DONE_COUNT bit (0x0010) is set
+        if ((status & 0x0010) != 0 && offset + 5 + 8 <= payload.Length)
+        {
+            rowCount = BinaryPrimitives.ReadInt64LittleEndian(payload.AsSpan(offset + 5, 8));
+        }
+
+        return true;
     }
 
     private async Task HandleSqlBatchAsync(TdsMessage message, CancellationToken ct)
@@ -296,11 +471,14 @@ public class ClientSession : IDisposable
         if (result.IsBlocked)
         {
             _auditLogger.LogBlocked(context, result.Reason!);
+            _metrics.RecordBlockedQuery(_username, _database, result.Reason ?? "unknown");
             await SendBlockedResponseAsync($"Query blocked by TailSqlProxy: {result.Reason}", ct);
             return;
         }
 
         _auditLogger.LogQuery(context);
+        _pendingQueries.Enqueue(context);
+        StartQueryTimeout(result, context);
         await WriteToServerAsync(message, ct);
     }
 
@@ -316,12 +494,45 @@ public class ClientSession : IDisposable
         if (result.IsBlocked)
         {
             _auditLogger.LogBlocked(context, result.Reason!);
+            _metrics.RecordBlockedQuery(_username, _database, result.Reason ?? "unknown");
             await SendBlockedResponseAsync($"Query blocked by TailSqlProxy: {result.Reason}", ct);
             return;
         }
 
         _auditLogger.LogQuery(context);
+        _pendingQueries.Enqueue(context);
+        StartQueryTimeout(result, context);
         await WriteToServerAsync(message, ct);
+    }
+
+    /// <summary>
+    /// Starts a timeout timer if the rule result includes AllowWithTimeout.
+    /// When the timer fires, SendAttentionAsync is called to cancel the query on the server.
+    /// </summary>
+    private void StartQueryTimeout(RuleResult result, QueryContext context)
+    {
+        // Cancel any previous timeout
+        CancelQueryTimeout();
+
+        if (!result.HasTimeout)
+            return;
+
+        _activeTimeoutMs = result.TimeoutMs!.Value;
+        _timeoutQueryContext = context;
+        _queryTimeoutCts = new CancellationTokenSource();
+        _queryTimeoutCts.CancelAfter(TimeSpan.FromMilliseconds(_activeTimeoutMs));
+
+        _logger.LogInformation(
+            "Query timeout armed: {TimeoutMs}ms | User={Username} | Reason={Reason} | SQL={Sql}",
+            _activeTimeoutMs, _username, result.Reason,
+            context.SqlText.Length > 200 ? context.SqlText[..200] + "..." : context.SqlText);
+    }
+
+    private void CancelQueryTimeout()
+    {
+        _queryTimeoutCts?.Dispose();
+        _queryTimeoutCts = null;
+        _timeoutQueryContext = null;
     }
 
     /// <summary>
@@ -458,6 +669,7 @@ public class ClientSession : IDisposable
         {
             foreach (var packet in message.Packets)
             {
+                _metrics.RecordBytesRelayed(packet.RawBytes.Length, "client_to_server");
                 await _serverWriter!.WriteRawAsync(packet.RawBytes, ct);
             }
         }
@@ -608,50 +820,17 @@ public class ClientSession : IDisposable
             await _clientWriter!.WriteRawAsync(packet.RawBytes, timeoutCts.Token);
 
             if (packet.Header.IsEndOfMessage && packet.Header.Type == TdsPacketType.TabularResult)
-                return !ContainsFinalDoneToken(packet.Payload);
-        }
-    }
-
-
-    /// <summary>
-    /// Checks if the packet payload ends with a DONE or DONEPROC token
-    /// that does not have the DONE_MORE (0x0001) status bit set.
-    /// </summary>
-    private static bool ContainsFinalDoneToken(byte[] payload)
-    {
-        const int doneTokenSize = 13;
-
-        if (payload.Length < doneTokenSize)
-            return false;
-
-        int offset = payload.Length - doneTokenSize;
-        byte tokenType = payload[offset];
-
-        if (tokenType is not (0xFD or 0xFE))
-        {
-            for (int i = payload.Length - doneTokenSize; i >= 0; i--)
             {
-                if (payload[i] is 0xFD or 0xFE)
-                {
-                    offset = i;
-                    tokenType = payload[i];
-                    break;
-                }
+                if (TryExtractDoneInfo(packet.Payload, out _, out bool isFinal) && isFinal)
+                    return false; // login complete
+                return true; // DONE_MORE — server expects further client input
             }
-
-            if (tokenType is not (0xFD or 0xFE))
-                return false;
         }
-
-        if (offset + 3 > payload.Length)
-            return false;
-
-        ushort status = BinaryPrimitives.ReadUInt16LittleEndian(payload.AsSpan(offset + 1, 2));
-        return (status & 0x0001) == 0;
     }
 
     public void Dispose()
     {
+        _queryTimeoutCts?.Dispose();
         _clientWriteLock.Dispose();
         _serverWriteLock.Dispose();
         _clientStream?.Dispose();

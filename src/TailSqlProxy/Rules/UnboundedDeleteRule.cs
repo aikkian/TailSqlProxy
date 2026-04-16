@@ -8,6 +8,8 @@ namespace TailSqlProxy.Rules;
 public class UnboundedDeleteRule : IQueryRule
 {
     private readonly ILogger<UnboundedDeleteRule> _logger;
+    private readonly UnboundedQueryMode _mode;
+    private readonly double _timeoutMs;
 
     public string Name => "UnboundedDelete";
     public bool IsEnabled { get; }
@@ -15,7 +17,10 @@ public class UnboundedDeleteRule : IQueryRule
     public UnboundedDeleteRule(IOptions<RuleOptions> options, ILogger<UnboundedDeleteRule> logger)
     {
         _logger = logger;
-        IsEnabled = options.Value.UnboundedDelete?.Enabled ?? true;
+        var opts = options.Value.UnboundedDelete;
+        IsEnabled = opts?.Enabled ?? true;
+        _mode = opts?.Mode ?? UnboundedQueryMode.Block;
+        _timeoutMs = opts?.TimeoutMs ?? 300_000;
     }
 
     public RuleResult Evaluate(QueryContext context)
@@ -40,7 +45,12 @@ public class UnboundedDeleteRule : IQueryRule
         fragment.Accept(visitor);
 
         if (visitor.HasViolation)
-            return RuleResult.Block($"DELETE without WHERE or TOP clause is not allowed. Fragment: {visitor.OffendingFragment}");
+        {
+            var reason = $"DELETE without WHERE or TOP clause. Fragment: {visitor.OffendingFragment}";
+            return _mode == UnboundedQueryMode.Timeout
+                ? RuleResult.AllowWithTimeout(_timeoutMs, reason)
+                : RuleResult.Block(reason);
+        }
 
         return RuleResult.Allow;
     }

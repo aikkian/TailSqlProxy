@@ -6,6 +6,7 @@ using Serilog.Sinks.Datadog.Logs;
 using TailSqlProxy.Configuration;
 using TailSqlProxy.Hosting;
 using TailSqlProxy.Logging;
+using TailSqlProxy.Monitoring;
 using TailSqlProxy.Proxy;
 using TailSqlProxy.Rules;
 
@@ -48,6 +49,7 @@ builder.Services.AddSerilog(config =>
 builder.Services.Configure<ProxyOptions>(builder.Configuration.GetSection("Proxy"));
 builder.Services.Configure<TargetServerOptions>(builder.Configuration.GetSection("TargetServer"));
 builder.Services.Configure<RuleOptions>(builder.Configuration.GetSection("Rules"));
+builder.Services.Configure<MetricsOptions>(builder.Configuration.GetSection("Metrics"));
 
 // Proxy infrastructure
 builder.Services.AddSingleton<CertificateProvider>();
@@ -65,6 +67,18 @@ builder.Services.AddSingleton<IRuleEngine, RuleEngine>();
 
 // Audit logging
 builder.Services.AddSingleton<IAuditLogger, AuditLogger>();
+
+// Metrics (Prometheus)
+var metricsEnabled = builder.Configuration.GetSection("Metrics").GetValue<bool>("Enabled");
+if (metricsEnabled)
+{
+    builder.Services.AddSingleton<IProxyMetrics, ProxyMetrics>();
+    builder.Services.AddHostedService<MetricsHostedService>();
+}
+else
+{
+    builder.Services.AddSingleton<IProxyMetrics>(NullProxyMetrics.Instance);
+}
 
 // Hosted service
 builder.Services.AddHostedService<ProxyHostedService>();

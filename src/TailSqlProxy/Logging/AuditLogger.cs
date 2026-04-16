@@ -20,6 +20,10 @@ public class AuditLogger : IAuditLogger, IDisposable
         var logPath = proxyOptions.AuditLogPath ?? "logs/audit-.log";
         var jsonLogPath = proxyOptions.AuditJsonLogPath;
 
+        // Ensure log directories exist
+        EnsureDirectoryExists(logPath);
+        EnsureDirectoryExists(jsonLogPath);
+
         var loggerConfig = new LoggerConfiguration()
             .MinimumLevel.Information()
             .WriteTo.File(
@@ -139,6 +143,14 @@ public class AuditLogger : IAuditLogger, IDisposable
         if (string.IsNullOrEmpty(text))
             return text;
         return text.Length <= MaxSqlLength ? text : text[..MaxSqlLength] + "...";
+    }
+
+    private static void EnsureDirectoryExists(string? filePath)
+    {
+        if (string.IsNullOrWhiteSpace(filePath)) return;
+        var dir = Path.GetDirectoryName(filePath);
+        if (!string.IsNullOrEmpty(dir))
+            Directory.CreateDirectory(dir);
     }
 
     public void Dispose()

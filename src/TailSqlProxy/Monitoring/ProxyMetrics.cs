@@ -61,7 +61,7 @@ public sealed class ProxyMetrics : IProxyMetrics
             new HistogramConfiguration
             {
                 LabelNames = ["user", "database"],
-                Buckets = metricsOptions.DurationBuckets
+                Buckets = metricsOptions.DurationBuckets.Distinct().OrderBy(b => b).ToArray()
             });
 
         _activeConnections = factory.CreateGauge(

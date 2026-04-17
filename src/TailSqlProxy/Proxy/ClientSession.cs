@@ -114,6 +114,7 @@ public class ClientSession : IDisposable
             // 1. Connect to target server
             _serverConnection = new TcpClient();
             _serverConnection.NoDelay = true;
+            SocketKeepAlive.Enable(_serverConnection.Client);
             await _serverConnection.ConnectAsync(_targetOptions.Host, _targetOptions.Port, ct);
             _logger.LogDebug("Connected to target server {Host}:{Port}", _targetOptions.Host, _targetOptions.Port);
 
@@ -625,6 +626,7 @@ public class ClientSession : IDisposable
             roHost, roPort, _sessionId);
 
         _readOnlyConnection = new TcpClient { NoDelay = true };
+        SocketKeepAlive.Enable(_readOnlyConnection.Client);
         await _readOnlyConnection.ConnectAsync(roHost, roPort, ct);
 
         var roNetStream = _readOnlyConnection.GetStream();

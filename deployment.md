@@ -1,6 +1,9 @@
 # Deployment Guide
 
-Reference for deploying TailSqlProxy to an Azure VM (Linux ARM64), single-instance on :1433.
+Reference for deploying TailSqlProxy to an Azure VM (Linux ARM64). Covers two topologies:
+
+1. **Single-instance** (sections 1–10) — one proxy on :1433, one upstream Azure SQL. Simplest path, good for dev or a single database.
+2. **Multi-instance** (section 11) — one proxy instance per upstream, each bound to a dedicated VM private/public IP on :1433. Clients use natural `<instance>.sql.<your-domain>` hostnames.
 
 ## Architecture
 
@@ -254,17 +257,234 @@ sqlcmd -S tcp:<VM_IP>,1433 -U <user> -P '<pw>' -C -N true
 ### Azure SQL auth fails but proxy is fine
 - Azure SQL firewall probably blocks the VM's outbound IP. Add the VM's public IP to Azure SQL → Networking → Firewall rules.
 
-## 11. Forward plan — multi-instance on :1433
+## 11. Multi-instance on :1433 (one instance per upstream)
 
-To route multiple Azure SQL upstreams through a single :1433 (one per subdomain), we'll attach additional secondary public IPs to the VM NIC and run one proxy instance per private IP via a systemd template unit (`tailsqlproxy@<instance>.service`). Each instance:
+Routes multiple Azure SQL upstreams through :1433 by running one proxy instance per upstream, each bound to a dedicated private IP on the VM NIC. Clients pick the upstream by which public IP (hostname) they connect to.
 
-- binds `ListenAddress` to its private IP on :1433
-- targets its own Azure SQL host via `TargetServer__Host` env var
-- writes audit logs to `/var/log/tailsqlproxy/<instance>/`
-- exposes metrics on a unique port
+### Topology
 
-The shared binary at `/opt/tailsqlproxy/` doesn't change. Per-instance overrides come from `/etc/tailsqlproxy/<instance>.env`.
+```
+Client
+   ↓ mercury.sql.<your-domain>,1433  →  <pip-1>
+Azure VM NIC (5 IP configurations on one NIC)
+   ├─ 172.21.0.4  ↔  <pip-1>  →  tailsqlproxy@mercury  →  example-mercury.database.windows.net
+   ├─ 172.21.0.5  ↔  <pip-2>  →  tailsqlproxy@venus    →  example-venus.database.windows.net
+   ├─ 172.21.0.6  ↔  <pip-3>  →  tailsqlproxy@earth    →  example-earth.database.windows.net
+   ├─ 172.21.0.7  ↔  <pip-4>  →  tailsqlproxy@mars     →  example-mars.database.windows.net
+   └─ 172.21.0.8  ↔  <pip-5>  →  tailsqlproxy@jupiter  →  example-jupiter.database.windows.net
+```
 
-Client-side DNS maps each subdomain to its dedicated public IP, so clients connect using natural hostnames (e.g. `mercury.sql.example.com,1433`) and each lands on the right proxy instance with the right upstream.
+All 5 instances share `/opt/tailsqlproxy/` (one binary). Per-instance overrides come from `/etc/tailsqlproxy/<instance>.env`. Each instance writes to its own `/var/log/tailsqlproxy/<instance>/` and exposes a unique metrics port.
 
-This section will be fleshed out once the additional public IPs are attached.
+### 11.1 Prerequisites (Azure Portal)
+
+1. **Create N extra Public IP resources** (Standard SKU, Static, same region as VM). Name them e.g. `tailsqlproxy-ip1..4` so they're easy to pick from a dropdown.
+2. **Add N secondary IP configurations** to the VM's NIC (VM → Networking → NIC → IP configurations → + Add):
+   - Name: `ipconfig<N>` (e.g. `ipconfig2`, `ipconfig3`, …)
+   - Type: Secondary
+   - Private IP allocation: Dynamic (OK) or Static (if you want a specific value)
+   - Associate public IP: pick the matching public IP you created
+3. **NSG** — if the :1433 rule is attached at NIC or subnet level, it already covers every IP on the NIC. Nothing to change.
+
+After this you should have N+1 total IP configurations on one NIC, each with a private + public IP.
+
+### 11.2 Guest OS: make the secondary private IPs visible
+
+Azure adds the secondaries to the NIC in the fabric, but Ubuntu's cloud-init netplan only configures the primary via DHCP. Add a **separate** netplan file for the secondaries — don't touch the cloud-init one.
+
+Query IMDS to confirm all IPs are assigned at the NIC level:
+
+```bash
+curl -s -H "Metadata:true" \
+  "http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress?api-version=2023-07-01" \
+  | python3 -m json.tool
+```
+
+Write `/etc/netplan/60-secondary-ips.yaml` listing the secondary private IPs (match the subnet prefix of your VNet):
+
+```yaml
+network:
+  version: 2
+  ethernets:
+    eth0:
+      addresses:
+        - 172.21.0.5/24
+        - 172.21.0.6/24
+        - 172.21.0.7/24
+        - 172.21.0.8/24
+```
+
+```bash
+sudo chmod 600 /etc/netplan/60-secondary-ips.yaml
+sudo netplan apply
+ip -4 addr show eth0 | grep "inet "   # should list all N+1 IPs
+```
+
+### 11.3 Stop the single-instance service (if running)
+
+```bash
+sudo systemctl stop tailsqlproxy.service
+sudo systemctl disable tailsqlproxy.service
+```
+
+(The binary in `/opt/tailsqlproxy/` stays — the template unit reuses it.)
+
+### 11.4 Per-instance env files
+
+Create one env file per instance in `/etc/tailsqlproxy/<instance>.env`. .NET reads these as config overrides (`Section__Key` naming maps to `Section:Key` in `appsettings.json`).
+
+Example (`/etc/tailsqlproxy/mercury.env`):
+
+```
+Proxy__ListenAddress=172.21.0.4
+TargetServer__Host=example-mercury.database.windows.net
+Proxy__AuditLogPath=/var/log/tailsqlproxy/mercury/audit-.log
+Proxy__AuditJsonLogPath=/var/log/tailsqlproxy/mercury/audit-json-.log
+Metrics__Port=9090
+```
+
+Repeat for each instance, bumping `ListenAddress` / `TargetServer__Host` / `Metrics__Port`. Per-instance log dirs must exist and be owned by `tdsproxy`:
+
+```bash
+for inst in mercury venus earth mars jupiter; do
+  sudo install -d -o tdsproxy -g tdsproxy -m 750 /var/log/tailsqlproxy/$inst
+done
+sudo chmod 640 /etc/tailsqlproxy/*.env
+sudo chown root:tdsproxy /etc/tailsqlproxy/*.env
+```
+
+### 11.5 systemd template unit
+
+Install `/etc/systemd/system/tailsqlproxy@.service`:
+
+```ini
+[Unit]
+Description=TailSqlProxy instance %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tdsproxy
+Group=tdsproxy
+WorkingDirectory=/opt/tailsqlproxy
+EnvironmentFile=/etc/tailsqlproxy/%i.env
+Environment=DOTNET_ENVIRONMENT=Production
+Environment=DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=false
+ExecStart=/opt/tailsqlproxy/TailSqlProxy
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/log/tailsqlproxy /opt/tailsqlproxy
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Reload and start all instances:
+
+```bash
+sudo systemctl daemon-reload
+for inst in mercury venus earth mars jupiter; do
+  sudo systemctl enable --now tailsqlproxy@$inst.service
+done
+```
+
+### 11.6 Verify
+
+```bash
+# all 5 active?
+for inst in mercury venus earth mars jupiter; do
+  printf "%-10s : " "$inst"
+  systemctl is-active tailsqlproxy@$inst.service
+done
+
+# listeners bound to their private IPs on :1433?
+sudo ss -tlnp | grep ':1433'
+
+# metrics ports unique?
+sudo ss -tlnp | grep -E ':909[0-9]'
+
+# end-to-end (from a client) — each public IP should reach its own upstream
+sqlcmd -S tcp:<pip-1>,1433 -U <user> -P '<pw>' -C -N true -Q "SELECT @@SERVERNAME"
+```
+
+Expected: `@@SERVERNAME` returns the upstream of that specific instance (e.g. hitting `<pip-1>` returns `example-mercury`'s name; `<pip-2>` returns `example-venus`'s; etc.).
+
+### 11.7 DNS
+
+Create A records (in whatever DNS you control for `<your-domain>`):
+
+```
+mercury.sql.<your-domain>  → <pip-1>
+venus.sql.<your-domain>    → <pip-2>
+earth.sql.<your-domain>    → <pip-3>
+mars.sql.<your-domain>     → <pip-4>
+jupiter.sql.<your-domain>  → <pip-5>
+```
+
+TTL 300s is fine. Clients then connect via the subdomain rather than raw IP.
+
+### 11.8 Azure SQL firewall
+
+Every upstream Azure SQL Server must allow the VM's outbound public IP in its **Networking → Firewall rules**. If the server uses a strict whitelist and doesn't include the VM's outbound IP, the proxy will relay an Azure SQL firewall error back to the client like:
+
+```
+Cannot open server '…' requested by the login. Client with IP address '<IP>' is not allowed to access the server.
+```
+
+Fix by either:
+- Adding the VM's outbound public IP(s) to each server's firewall rules, or
+- Enabling **Allow Azure services and resources to access this server** on each server.
+
+### 11.9 Client connection strings
+
+```
+jdbc:sqlserver://mercury.sql.<your-domain>:1433;encrypt=true;trustServerCertificate=true;database=<db>
+jdbc:sqlserver://venus.sql.<your-domain>:1433;encrypt=true;trustServerCertificate=true;database=<db>
+```
+
+```bash
+sqlcmd -S tcp:mercury.sql.<your-domain>,1433 -U <user> -P '<pw>' -C -N true
+```
+
+### 11.10 Updating (replace the binary across all instances)
+
+```bash
+# build machine
+dotnet publish src/TailSqlProxy -c Release -r linux-arm64 --self-contained true -o ./publish
+tar -czf /tmp/tailsqlproxy.tar.gz -C publish .
+scp -i ~/Downloads/tailsqlproxy_key.pem /tmp/tailsqlproxy.tar.gz tailsqlproxy@<VM_IP>:/tmp/
+
+# VM
+for inst in mercury venus earth mars jupiter; do
+  sudo systemctl stop tailsqlproxy@$inst.service
+done
+sudo tar -xzf /tmp/tailsqlproxy.tar.gz -C /opt/tailsqlproxy
+sudo chown -R tdsproxy:tdsproxy /opt/tailsqlproxy
+sudo setcap 'cap_net_bind_service=+ep' /opt/tailsqlproxy/TailSqlProxy
+for inst in mercury venus earth mars jupiter; do
+  sudo systemctl start tailsqlproxy@$inst.service
+done
+```
+
+### 11.11 Adding another instance later
+
+1. Create one more public IP + secondary IP config on the NIC (Azure Portal).
+2. Add the new private IP to `/etc/netplan/60-secondary-ips.yaml`, `sudo netplan apply`.
+3. Drop an env file at `/etc/tailsqlproxy/<newname>.env`.
+4. `sudo mkdir -p /var/log/tailsqlproxy/<newname>` and chown to `tdsproxy`.
+5. `sudo systemctl enable --now tailsqlproxy@<newname>.service`.
+6. Add a DNS A record.
+
+No template-unit or binary changes required.

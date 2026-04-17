@@ -10,6 +10,12 @@ public class ProxyOptions
     /// <summary>Optional path for JSON structured audit log (SIEM-ready). Null = disabled.</summary>
     public string? AuditJsonLogPath { get; set; }
     public DatadogOptions Datadog { get; set; } = new();
+
+    /// <summary>
+    /// IP whitelist. If empty, all client IPs are allowed.
+    /// If non-empty, only listed IPs can connect — all others are rejected immediately.
+    /// </summary>
+    public string[] AllowedClientIps { get; set; } = [];
 }
 
 public class DatadogOptions

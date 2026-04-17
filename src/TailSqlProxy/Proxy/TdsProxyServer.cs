@@ -46,6 +46,7 @@ public class TdsProxyServer
             while (!ct.IsCancellationRequested)
             {
                 var client = await _listener.AcceptTcpClientAsync(ct);
+                SocketKeepAlive.Enable(client.Client);
                 var clientEndpoint = client.Client.RemoteEndPoint as IPEndPoint;
                 var clientIp = clientEndpoint?.Address.ToString();
                 _logger.LogInformation("New connection from {ClientIp}", clientIp);

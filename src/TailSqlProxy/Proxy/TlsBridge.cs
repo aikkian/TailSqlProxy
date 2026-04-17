@@ -70,10 +70,11 @@ public class TlsBridge
         var serverWrapper = new TdsPreLoginWrapperStream(serverRawStream);
         var serverSsl = new SslStream(serverWrapper, leaveInnerStreamOpen: true, ValidateServerCertificate);
 
+        // TLS 1.2 only on the wrapped path — see matching comment in EstablishClientTds7TlsAsync.
         await serverSsl.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
         {
             TargetHost = targetServerHostname,
-            EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+            EnabledSslProtocols = SslProtocols.Tls12,
             RemoteCertificateValidationCallback = ValidateServerCertificate,
         }, ct);
 
@@ -122,11 +123,14 @@ public class TlsBridge
         var clientWrapper = new TdsPreLoginWrapperStream(clientRawStream);
         var clientSsl = new SslStream(clientWrapper, leaveInnerStreamOpen: true);
 
+        // TLS 1.2 only on the wrapped path: TLS 1.3 emits post-handshake NewSessionTicket
+        // messages that leak through the wrapper as TDS-wrapped packets on Linux OpenSSL,
+        // corrupting the record stream after the handshake ends.
         await clientSsl.AuthenticateAsServerAsync(new SslServerAuthenticationOptions
         {
             ServerCertificate = proxyCert,
             ClientCertificateRequired = false,
-            EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+            EnabledSslProtocols = SslProtocols.Tls12,
         }, ct);
 
         // Switch wrapper to passthrough — after TLS handshake, TLS records

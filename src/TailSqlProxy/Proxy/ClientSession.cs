@@ -972,13 +972,32 @@ public class ClientSession : IDisposable
         foreach (var packet in loginMessage.Packets)
             await _serverWriter!.WriteRawAsync(packet.RawBytes, ct);
 
-        // Forward server's login response. Returns true if the server signalled DONE_MORE,
-        // meaning more exchanges are expected (e.g. FedAuth challenge → client token → final response).
-        bool moreExpected = await ForwardLoginResponseAsync(ct);
+        // Read the login response — check if Azure SQL sends a routing redirect.
+        // If so, we consume the gateway response (don't forward to client), follow the
+        // redirect, and forward only the database node's response to the client.
+        var (redirectResult, moreExpected) = await CheckForRoutingRedirectAsync(ct);
 
+        if (redirectResult != null)
+        {
+            _logger.LogInformation("Following Azure SQL routing redirect to {Host}:{Port}",
+                redirectResult.Value.Host, redirectResult.Value.Port);
+
+            await FollowRoutingRedirectAsync(
+                redirectResult.Value.Host, redirectResult.Value.Port, loginMessage, ct);
+
+            // Rewrite Login7 server name for the database node and send
+            var dbNodeLogin = RewriteLogin7ServerName(loginMessage, redirectResult.Value.Host);
+            foreach (var packet in dbNodeLogin.Packets)
+                await _serverWriter!.WriteRawAsync(packet.RawBytes, ct);
+
+            // Forward the database node's login response to the client
+            (moreExpected, _) = await ForwardLoginResponseAsync(ct);
+        }
+        // else: no redirect — CheckForRoutingRedirectAsync already forwarded the response
+
+        // Handle FedAuth exchanges if the server expects more input
         while (moreExpected)
         {
-            // Server is waiting for the client's next message (FedAuth token for Entra ID).
             var nextMessage = await _clientReader!.ReadMessageAsync(ct);
             if (nextMessage == null)
                 throw new InvalidOperationException("Client disconnected during login handshake.");
@@ -988,7 +1007,7 @@ public class ClientSession : IDisposable
                 _logger.LogWarning("Expected FederatedAuthToken but got {Type}", nextMessage.Type);
                 foreach (var packet in nextMessage.Packets)
                     await _serverWriter!.WriteRawAsync(packet.RawBytes, ct);
-                moreExpected = await ForwardLoginResponseAsync(ct);
+                (moreExpected, _) = await ForwardLoginResponseAsync(ct);
                 continue;
             }
 
@@ -996,7 +1015,7 @@ public class ClientSession : IDisposable
             foreach (var packet in nextMessage.Packets)
                 await _serverWriter!.WriteRawAsync(packet.RawBytes, ct);
 
-            moreExpected = await ForwardLoginResponseAsync(ct);
+            (moreExpected, _) = await ForwardLoginResponseAsync(ct);
 
             if (string.IsNullOrEmpty(_username))
                 _username = "entra-id-user";
@@ -1004,14 +1023,102 @@ public class ClientSession : IDisposable
     }
 
     /// <summary>
-    /// Forwards a server-side login response to the client. Returns true if the response
-    /// ended with a DONE token that has the DONE_MORE bit set (indicating the server expects
-    /// further client input — e.g. a FedAuth token), or false if login is complete.
+    /// Follows an Azure SQL routing redirect by disconnecting from the gateway
+    /// and reconnecting to the database node with a full TDS 7.x handshake.
     /// </summary>
-    private async Task<bool> ForwardLoginResponseAsync(CancellationToken ct)
+    private async Task FollowRoutingRedirectAsync(
+        string host, int port, TdsMessage loginMessage, CancellationToken ct)
+    {
+        // Close the gateway connection
+        _serverStream?.Dispose();
+        _serverConnection?.Close();
+
+        // Connect to the database node
+        _serverConnection = new TcpClient { NoDelay = true };
+        await _serverConnection.ConnectAsync(host, port, ct);
+        _logger.LogDebug("Connected to database node {Host}:{Port}", host, port);
+
+        var serverNetStream = _serverConnection.GetStream();
+
+        // Full TDS 7.x handshake with the database node
+        var proxyPreLogin = BuildPreLoginPacket();
+        await serverNetStream.WriteAsync(proxyPreLogin, ct);
+        await serverNetStream.FlushAsync(ct);
+
+        var rawReader = new TdsMessageReader(serverNetStream);
+        var preLoginResp = await rawReader.ReadMessageAsync(ct);
+        if (preLoginResp == null)
+            throw new InvalidOperationException("Database node disconnected during PreLogin.");
+
+        _serverStream = await _tlsBridge.EstablishServerTds7TlsAsync(
+            serverNetStream, host, ct);
+
+        InitializeReadersAndWriters();
+    }
+
+    private readonly record struct RoutingRedirect(string Host, int Port);
+
+    /// <summary>
+    /// Reads the server's login response looking for a routing redirect.
+    /// If a redirect is found, the response is consumed (not forwarded to the client)
+    /// and the redirect target is returned — the caller should follow it.
+    /// If no redirect, the response is forwarded to the client and moreExpected indicates
+    /// whether FedAuth follow-up is needed.
+    /// </summary>
+    private async Task<(RoutingRedirect? Redirect, bool MoreExpected)> CheckForRoutingRedirectAsync(
+        CancellationToken ct)
     {
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeoutCts.CancelAfter(ResponseTimeout);
+
+        var consumedPackets = new List<TdsPacket>();
+        bool moreExpected = false;
+
+        while (true)
+        {
+            var packet = await _serverReader!.ReadPacketAsync(timeoutCts.Token);
+            if (packet == null)
+            {
+                _logger.LogWarning("Server disconnected during login response");
+                break;
+            }
+
+            consumedPackets.Add(packet);
+
+            // Check for routing redirect
+            var extracted = TryExtractRoutingRedirect(packet.Payload);
+            if (extracted != null)
+                return (extracted.Value.Redirect, false);
+
+            if (packet.Header.IsEndOfMessage && packet.Header.Type == TdsPacketType.TabularResult)
+            {
+                if (TryExtractDoneInfo(packet.Payload, out _, out bool isFinal))
+                    moreExpected = !isFinal;
+                break;
+            }
+        }
+
+        // No redirect — forward the consumed response to the client
+        foreach (var pkt in consumedPackets)
+            await _clientWriter!.WriteRawAsync(pkt.RawBytes, ct);
+
+        return (null, moreExpected);
+    }
+
+    /// <summary>
+    /// Forwards a server-side login response to the client. Detects and strips any
+    /// Azure SQL routing redirect (ENVCHANGE type 20) so the client stays on the proxy.
+    /// Returns (moreExpected, redirect):
+    ///   moreExpected = true if the server sent DONE_MORE (expects FedAuth token)
+    ///   redirect = non-null if a routing redirect was found (proxy should follow it)
+    /// </summary>
+    private async Task<(bool MoreExpected, RoutingRedirect? Redirect)> ForwardLoginResponseAsync(
+        CancellationToken ct)
+    {
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(ResponseTimeout);
+
+        RoutingRedirect? redirect = null;
 
         while (true)
         {
@@ -1019,18 +1126,98 @@ public class ClientSession : IDisposable
             if (packet == null)
             {
                 _logger.LogWarning("Server disconnected during login response forwarding");
-                return false;
+                return (false, redirect);
             }
 
-            await _clientWriter!.WriteRawAsync(packet.RawBytes, timeoutCts.Token);
+            // Check for routing redirect and strip it from the payload
+            var payload = packet.Payload;
+            var extracted = TryExtractRoutingRedirect(payload);
+            if (extracted != null)
+            {
+                redirect = extracted.Value.Redirect;
+                payload = extracted.Value.StrippedPayload;
+                _logger.LogInformation("Detected Azure SQL routing redirect to {Host}:{Port}",
+                    redirect.Value.Host, redirect.Value.Port);
+
+                // Rebuild packet with the stripped payload
+                var newHeader = new TdsPacketHeader(
+                    type: packet.Header.Type,
+                    status: packet.Header.Status,
+                    length: (ushort)(TdsPacketHeader.Size + payload.Length),
+                    spid: packet.Header.Spid,
+                    packetId: packet.Header.PacketId,
+                    window: packet.Header.Window);
+                var raw = new byte[TdsPacketHeader.Size + payload.Length];
+                newHeader.WriteTo(raw);
+                Array.Copy(payload, 0, raw, TdsPacketHeader.Size, payload.Length);
+                await _clientWriter!.WriteRawAsync(raw, timeoutCts.Token);
+            }
+            else
+            {
+                await _clientWriter!.WriteRawAsync(packet.RawBytes, timeoutCts.Token);
+            }
 
             if (packet.Header.IsEndOfMessage && packet.Header.Type == TdsPacketType.TabularResult)
             {
-                if (TryExtractDoneInfo(packet.Payload, out _, out bool isFinal) && isFinal)
-                    return false; // login complete
-                return true; // DONE_MORE — server expects further client input
+                if (TryExtractDoneInfo(payload, out _, out bool isFinal) && isFinal)
+                    return (false, redirect);
+                return (true, redirect);
             }
         }
+    }
+
+    /// <summary>
+    /// Finds an ENVCHANGE Routing token (type 0xE3, envchange type 20) in a TDS payload,
+    /// extracts the redirect target, and returns the payload with the token removed.
+    /// Returns null if no routing token was found.
+    ///
+    /// Routing ENVCHANGE format:
+    ///   0xE3 | length(2 LE) | type=20 | newValueLen(2 LE) | protocol(1) | port(2 LE) |
+    ///   serverNameLen(2 LE) | serverName(Unicode) | oldValueLen(2 LE) | oldValue...
+    /// </summary>
+    private static (RoutingRedirect Redirect, byte[] StrippedPayload)? TryExtractRoutingRedirect(
+        byte[] payload)
+    {
+        for (int i = 0; i < payload.Length - 4; i++)
+        {
+            if (payload[i] != 0xE3) continue;
+
+            ushort tokenDataLen = BinaryPrimitives.ReadUInt16LittleEndian(payload.AsSpan(i + 1));
+            int fullTokenLen = 1 + 2 + tokenDataLen;
+
+            if (i + fullTokenLen > payload.Length) continue;
+            if (tokenDataLen < 8) continue; // Minimum: type + newValueLen + protocol + port + serverNameLen
+            if (payload[i + 3] != 20) continue; // Not routing type
+
+            // Parse the routing data
+            int pos = i + 4; // skip token type (1) + length (2) + envchange type (1)
+            ushort newValueLen = BinaryPrimitives.ReadUInt16LittleEndian(payload.AsSpan(pos));
+            pos += 2;
+
+            if (pos + newValueLen > i + fullTokenLen) continue;
+
+            byte protocol = payload[pos]; pos += 1;
+            if (protocol != 0) continue; // Only TCP (0) is supported
+
+            ushort port = BinaryPrimitives.ReadUInt16LittleEndian(payload.AsSpan(pos));
+            pos += 2;
+
+            ushort serverNameChars = BinaryPrimitives.ReadUInt16LittleEndian(payload.AsSpan(pos));
+            pos += 2;
+
+            if (pos + serverNameChars * 2 > payload.Length) continue;
+
+            string serverName = System.Text.Encoding.Unicode.GetString(payload, pos, serverNameChars * 2);
+
+            // Strip this token from the payload
+            var stripped = new byte[payload.Length - fullTokenLen];
+            Array.Copy(payload, 0, stripped, 0, i);
+            Array.Copy(payload, i + fullTokenLen, stripped, i, payload.Length - i - fullTokenLen);
+
+            return (new RoutingRedirect(serverName, port), stripped);
+        }
+
+        return null;
     }
 
     public void Dispose()

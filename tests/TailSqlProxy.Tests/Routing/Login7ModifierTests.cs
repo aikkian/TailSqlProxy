@@ -9,36 +9,36 @@ public class Login7ModifierTests
     [Fact]
     public void SetReadOnlyIntent_SetsTypeFlagsBit()
     {
-        // Create a minimal Login7 payload (at least 33 bytes to reach TypeFlags at offset 32)
+        // Create a minimal Login7 payload (at least 27 bytes to reach TypeFlags at offset 26)
         var payload = new byte[90];
-        payload[32] = 0x00; // TypeFlags — no flags set
+        payload[26] = 0x00; // TypeFlags — no flags set
 
         var modified = Login7Modifier.SetReadOnlyIntent(payload);
 
         Login7Modifier.HasReadOnlyIntent(modified).Should().BeTrue();
-        (modified[32] & 0x20).Should().NotBe(0, "bit 5 (ReadOnly intent) should be set");
+        (modified[26] & 0x20).Should().NotBe(0, "bit 5 (ReadOnly intent) should be set");
     }
 
     [Fact]
     public void SetReadOnlyIntent_PreservesExistingFlags()
     {
         var payload = new byte[90];
-        payload[32] = 0x05; // Some other flags set (bits 0 and 2)
+        payload[26] = 0x05; // Some other flags set (bits 0 and 2)
 
         var modified = Login7Modifier.SetReadOnlyIntent(payload);
 
-        modified[32].Should().Be(0x25, "should preserve existing flags and add ReadOnly bit");
+        modified[26].Should().Be(0x25, "should preserve existing flags and add ReadOnly bit");
     }
 
     [Fact]
     public void SetReadOnlyIntent_IdempotentWhenAlreadySet()
     {
         var payload = new byte[90];
-        payload[32] = 0x20; // Already has ReadOnly intent
+        payload[26] = 0x20; // Already has ReadOnly intent
 
         var modified = Login7Modifier.SetReadOnlyIntent(payload);
 
-        modified[32].Should().Be(0x20);
+        modified[26].Should().Be(0x20);
         Login7Modifier.HasReadOnlyIntent(modified).Should().BeTrue();
     }
 
@@ -46,19 +46,19 @@ public class Login7ModifierTests
     public void SetReadOnlyIntent_DoesNotModifyOriginal()
     {
         var payload = new byte[90];
-        payload[32] = 0x00;
+        payload[26] = 0x00;
 
         var modified = Login7Modifier.SetReadOnlyIntent(payload);
 
-        payload[32].Should().Be(0x00, "original should be unchanged");
-        modified[32].Should().Be(0x20);
+        payload[26].Should().Be(0x00, "original should be unchanged");
+        modified[26].Should().Be(0x20);
     }
 
     [Fact]
     public void HasReadOnlyIntent_ReturnsFalse_WhenNotSet()
     {
         var payload = new byte[90];
-        payload[32] = 0x00;
+        payload[26] = 0x00;
 
         Login7Modifier.HasReadOnlyIntent(payload).Should().BeFalse();
     }

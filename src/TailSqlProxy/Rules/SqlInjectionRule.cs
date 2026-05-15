@@ -76,9 +76,11 @@ public class SqlInjectionRule : IQueryRule
         (@"(?i)/\*.*?\*/\s*(UNION|SELECT|DROP|DELETE|INSERT|UPDATE|ALTER|EXEC)\b", "Comment evasion: inline comment before keyword"),
         (@"(?i)(UNION|SELECT|DROP|DELETE|INSERT|UPDATE|ALTER|EXEC)\s*/\*.*?\*/", "Comment evasion: inline comment after keyword"),
 
-        // Hex/CHAR encoding attacks
+        // Hex/CHAR encoding attacks — only flag hex in suspicious contexts (EXEC, CHAR, string concat).
+        // Standalone hex literals like 0x0000000244ED48B6 are legitimate rowversion/timestamp values.
         (@"(?i)\bCHAR\s*\(\s*0x", "Hex encoding attack: CHAR(0x...)"),
-        (@"(?i)0x[0-9a-fA-F]{8,}", "Hex string literal (potential encoded payload)"),
+        (@"(?i)\bEXEC\w*\s*\(\s*0x[0-9a-fA-F]{8,}", "Hex encoding attack: EXEC(0x...)"),
+        (@"(?i)\+\s*0x[0-9a-fA-F]{8,}", "Hex string concatenation (potential encoded payload)"),
 
         // Information schema probing (common in automated injection tools)
         (@"(?i)\bSELECT\b.*\bFROM\b.*\bsysobjects\b", "Schema probing: sysobjects"),

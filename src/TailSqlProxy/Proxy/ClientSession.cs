@@ -76,6 +76,11 @@ public class ClientSession : IDisposable
     // Timeout for response forwarding (prevents hung connections)
     private static readonly TimeSpan ResponseTimeout = TimeSpan.FromMinutes(5);
 
+    // Timeout for the entire handshake phase (peek + PreLogin + TLS + Login7).
+    // Prevents bots/scanners that connect but never complete the handshake from
+    // exhausting the thread pool and blocking legitimate connections.
+    private static readonly TimeSpan HandshakeTimeout = TimeSpan.FromSeconds(30);
+
     public ClientSession(
         IOptions<TargetServerOptions> targetOptions,
         IOptions<ProxyOptions> proxyOptions,
@@ -104,6 +109,12 @@ public class ClientSession : IDisposable
 
         try
         {
+            // Apply a handshake timeout to prevent bots/scanners from holding connections
+            // indefinitely. Covers: peek, PreLogin, TLS, Login7, and FedAuth exchanges.
+            using var handshakeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            handshakeCts.CancelAfter(HandshakeTimeout);
+            var hct = handshakeCts.Token;
+
             // Peek at first byte to detect TDS version without consuming it
             var peekBuf = new byte[1];
             int peekRead = client.Client.Receive(peekBuf, 0, 1, System.Net.Sockets.SocketFlags.Peek);
@@ -115,7 +126,7 @@ public class ClientSession : IDisposable
             _serverConnection = new TcpClient();
             _serverConnection.NoDelay = true;
             SocketKeepAlive.Enable(_serverConnection.Client);
-            await _serverConnection.ConnectAsync(_targetOptions.Host, _targetOptions.Port, ct);
+            await _serverConnection.ConnectAsync(_targetOptions.Host, _targetOptions.Port, hct);
             _logger.LogDebug("Connected to target server {Host}:{Port}", _targetOptions.Host, _targetOptions.Port);
 
             var clientNetStream = client.GetStream();
@@ -128,21 +139,21 @@ public class ClientSession : IDisposable
                 // TDS 7.x server requires a PreLogin exchange before TLS, so the proxy
                 // generates one on behalf of the (TDS 8.0) client which has yet to speak.
                 var proxyPreLogin = BuildPreLoginPacket();
-                await serverNetStream.WriteAsync(proxyPreLogin, ct);
-                await serverNetStream.FlushAsync(ct);
+                await serverNetStream.WriteAsync(proxyPreLogin, hct);
+                await serverNetStream.FlushAsync(hct);
 
                 var rawServerReader = new TdsMessageReader(serverNetStream);
-                var serverPreLoginMsg = await rawServerReader.ReadMessageAsync(ct);
+                var serverPreLoginMsg = await rawServerReader.ReadMessageAsync(hct);
                 if (serverPreLoginMsg == null)
                     throw new InvalidOperationException("Server disconnected during PreLogin.");
 
                 _serverStream = await _tlsBridge.EstablishServerTds7TlsAsync(
-                    serverNetStream, _targetOptions.Host, ct);
-                _clientStream = await _tlsBridge.AcceptClientTlsAsync(clientNetStream, ct);
+                    serverNetStream, _targetOptions.Host, hct);
+                _clientStream = await _tlsBridge.AcceptClientTlsAsync(clientNetStream, hct);
                 InitializeReadersAndWriters();
 
                 // Client expects PreLogin over its (now-established) TLS in TDS 8.0
-                await ForwardPreLoginAsync(ct);
+                await ForwardPreLoginAsync(hct);
             }
             else
             {
@@ -150,31 +161,31 @@ public class ClientSession : IDisposable
 
                 // Relay raw PreLogin in both directions before either side starts TLS.
                 var rawClientReader = new TdsMessageReader(clientNetStream);
-                var clientPreLogin = await rawClientReader.ReadMessageAsync(ct);
+                var clientPreLogin = await rawClientReader.ReadMessageAsync(hct);
                 if (clientPreLogin == null)
                     throw new InvalidOperationException("Client disconnected during PreLogin.");
 
                 foreach (var pkt in clientPreLogin.Packets)
-                    await serverNetStream.WriteAsync(pkt.RawBytes, ct);
-                await serverNetStream.FlushAsync(ct);
+                    await serverNetStream.WriteAsync(pkt.RawBytes, hct);
+                await serverNetStream.FlushAsync(hct);
 
                 var rawServerReader = new TdsMessageReader(serverNetStream);
-                var serverPreLogin = await rawServerReader.ReadMessageAsync(ct);
+                var serverPreLogin = await rawServerReader.ReadMessageAsync(hct);
                 if (serverPreLogin == null)
                     throw new InvalidOperationException("Server disconnected during PreLogin.");
 
                 foreach (var pkt in serverPreLogin.Packets)
-                    await clientNetStream.WriteAsync(pkt.RawBytes, ct);
-                await clientNetStream.FlushAsync(ct);
+                    await clientNetStream.WriteAsync(pkt.RawBytes, hct);
+                await clientNetStream.FlushAsync(hct);
 
                 _serverStream = await _tlsBridge.EstablishServerTds7TlsAsync(
-                    serverNetStream, _targetOptions.Host, ct);
-                _clientStream = await _tlsBridge.EstablishClientTds7TlsAsync(clientNetStream, ct);
+                    serverNetStream, _targetOptions.Host, hct);
+                _clientStream = await _tlsBridge.EstablishClientTds7TlsAsync(clientNetStream, hct);
                 InitializeReadersAndWriters();
             }
 
             // Handle Login7 (extract user/db info, then forward)
-            await HandleLogin7Async(ct);
+            await HandleLogin7Async(hct);
 
             _auditLogger.LogConnection(_clientIp, _username, _database, _appName, _sessionId);
 
@@ -190,7 +201,17 @@ public class ClientSession : IDisposable
             // Bidirectional relay — two concurrent tasks for MARS support
             await RunBidirectionalRelayAsync(ct);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Application shutdown — propagate silently
+        }
+        catch (OperationCanceledException)
+        {
+            // Handshake timeout — bot/scanner that never completed TLS
+            _logger.LogWarning("Handshake timeout for client {ClientIp} (exceeded {Timeout}s)",
+                _clientIp, HandshakeTimeout.TotalSeconds);
+        }
+        catch (Exception ex)
         {
             _logger.LogError(ex, "Session error for client {ClientIp}", _clientIp);
         }

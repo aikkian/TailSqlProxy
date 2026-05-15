@@ -278,9 +278,21 @@ public class SqlInjectionRuleTests
     // =============================================
 
     [Fact]
-    public void Blocks_LongHexLiteral()
+    public void Blocks_HexInExecContext()
     {
-        _rule.Evaluate(Ctx("SELECT 0x44524F50205441424C45")).IsBlocked.Should().BeTrue();
+        _rule.Evaluate(Ctx("EXEC(0x44524F50205441424C45)")).IsBlocked.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Blocks_HexConcatenation()
+    {
+        _rule.Evaluate(Ctx("SELECT 'test' + 0x44524F50205441424C45")).IsBlocked.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Allows_Standalone_Hex_Rowversion()
+    {
+        _rule.Evaluate(Ctx("SELECT * FROM orders WHERE update_timestamp > 0x0000000244ED48B6")).IsBlocked.Should().BeFalse();
     }
 
     // =============================================

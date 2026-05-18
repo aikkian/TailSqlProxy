@@ -219,12 +219,18 @@ public class SqlInjectionRuleTests
     // =============================================
 
     [Theory]
-    [InlineData("SELECT @@version")]
     [InlineData("SELECT user_name()")]
     [InlineData("SELECT system_user")]
     public void Blocks_InformationProbing(string sql)
     {
         _rule.Evaluate(Ctx(sql)).IsBlocked.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Allows_SelectAtAtVersion()
+    {
+        // @@version is a standard query sent by SSMS, DataGrip, and all JDBC/ODBC drivers
+        _rule.Evaluate(Ctx("SELECT @@version")).IsBlocked.Should().BeFalse();
     }
 
     [Theory]

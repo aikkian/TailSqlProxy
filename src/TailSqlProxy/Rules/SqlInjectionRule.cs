@@ -85,7 +85,7 @@ public class SqlInjectionRule : IQueryRule
         // Information schema probing (common in automated injection tools)
         (@"(?i)\bSELECT\b.*\bFROM\b.*\bsysobjects\b", "Schema probing: sysobjects"),
         (@"(?i)\bSELECT\b.*\bFROM\b.*\bsyscolumns\b", "Schema probing: syscolumns"),
-        (@"(?i)@@version\b", "Information probing: @@version"),
+        // @@version removed — legitimate query sent by SSMS, DataGrip, and all JDBC/ODBC drivers
         (@"(?i)\buser_name\s*\(\s*\)", "Information probing: user_name()"),
         (@"(?i)\bsystem_user\b", "Information probing: system_user"),
 

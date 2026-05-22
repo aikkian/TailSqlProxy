@@ -328,8 +328,18 @@ public class ClientSession : IDisposable
                     break;
 
                 default:
-                    // Attention, TransactionManagerRequest, etc. — forward transparently
-                    await WriteToServerAsync(message, ct);
+                    // Attention (cancel), TransactionManagerRequest, etc.
+                    // Route to whichever server the last query was sent to.
+                    if (message.Type == TdsPacketType.Attention
+                        && _lastQueryTarget == RouteTarget.ReadOnly
+                        && _readOnlyWriter != null)
+                    {
+                        await WriteToReadOnlyServerAsync(message, ct);
+                    }
+                    else
+                    {
+                        await WriteToServerAsync(message, ct);
+                    }
                     break;
             }
         }

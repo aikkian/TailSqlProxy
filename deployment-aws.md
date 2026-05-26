@@ -7,11 +7,11 @@ Deploy 5 proxy instances on a single EC2 instance, each with its own Elastic IP,
 ```
 DNS                    Elastic IP          Private IP       Target Azure SQL
 ─────────────────────  ──────────────────  ──────────────   ──────────────────────────────────
-db.mercury.xilnex.com  → EIP-1 (x.x.x.1)  → 10.0.1.10    → xilnex-mercury.database.windows.net
-db.venus.xilnex.com    → EIP-2 (x.x.x.2)  → 10.0.1.11    → xilnex-venus.database.windows.net
-db.earth.xilnex.com    → EIP-3 (x.x.x.3)  → 10.0.1.12    → xilnex-earth.database.windows.net
-db.uranus.xilnex.com   → EIP-4 (x.x.x.4)  → 10.0.1.13    → xilnex-uranus.database.windows.net
-db.mbntu1.xilnex.com   → EIP-5 (x.x.x.5)  → 10.0.1.14    → xilnex-mbntu1.database.windows.net
+db.mercury.example.com  → EIP-1 (x.x.x.1)  → 10.0.1.10    → example-mercury.database.windows.net
+db.venus.example.com    → EIP-2 (x.x.x.2)  → 10.0.1.11    → example-venus.database.windows.net
+db.earth.example.com    → EIP-3 (x.x.x.3)  → 10.0.1.12    → example-earth.database.windows.net
+db.uranus.example.com   → EIP-4 (x.x.x.4)  → 10.0.1.13    → example-uranus.database.windows.net
+db.mbntu1.example.com   → EIP-5 (x.x.x.5)  → 10.0.1.14    → example-mbntu1.database.windows.net
 ```
 
 All 5 instances listen on port 1433, each bound to its own private IP.
@@ -115,11 +115,11 @@ All 5 instances listen on port 1433, each bound to its own private IP.
 
    | Instance | Private IP | Elastic IP | Target Azure SQL |
    |----------|-----------|------------|------------------|
-   | mercury  | 10.0.1.10 | EIP-1      | xilnex-mercury.database.windows.net |
-   | venus    | 10.0.1.11 | EIP-2      | xilnex-venus.database.windows.net |
-   | earth    | 10.0.1.12 | EIP-3      | xilnex-earth.database.windows.net |
-   | uranus   | 10.0.1.13 | EIP-4      | xilnex-uranus.database.windows.net |
-   | mbntu1   | 10.0.1.14 | EIP-5      | xilnex-mbntu1.database.windows.net |
+   | mercury  | 10.0.1.10 | EIP-1      | example-mercury.database.windows.net |
+   | venus    | 10.0.1.11 | EIP-2      | example-venus.database.windows.net |
+   | earth    | 10.0.1.12 | EIP-3      | example-earth.database.windows.net |
+   | uranus   | 10.0.1.13 | EIP-4      | example-uranus.database.windows.net |
+   | mbntu1   | 10.0.1.14 | EIP-5      | example-mbntu1.database.windows.net |
 
 ---
 
@@ -207,7 +207,7 @@ The `appsettings.json` in `/opt/tailsqlproxy/` is the shared base. Instance-spec
 # Mercury
 sudo tee /etc/tailsqlproxy/mercury.env << 'EOF'
 Proxy__ListenAddress=10.0.1.10
-TargetServer__Host=xilnex-mercury.database.windows.net
+TargetServer__Host=example-mercury.database.windows.net
 Proxy__AuditLogPath=/var/log/tailsqlproxy/mercury/audit-.log
 Proxy__AuditJsonLogPath=/var/log/tailsqlproxy/mercury/audit-json-.log
 Metrics__Port=9090
@@ -216,7 +216,7 @@ EOF
 # Venus
 sudo tee /etc/tailsqlproxy/venus.env << 'EOF'
 Proxy__ListenAddress=10.0.1.11
-TargetServer__Host=xilnex-venus.database.windows.net
+TargetServer__Host=example-venus.database.windows.net
 Proxy__AuditLogPath=/var/log/tailsqlproxy/venus/audit-.log
 Proxy__AuditJsonLogPath=/var/log/tailsqlproxy/venus/audit-json-.log
 Metrics__Port=9091
@@ -225,7 +225,7 @@ EOF
 # Earth
 sudo tee /etc/tailsqlproxy/earth.env << 'EOF'
 Proxy__ListenAddress=10.0.1.12
-TargetServer__Host=xilnex-earth.database.windows.net
+TargetServer__Host=example-earth.database.windows.net
 Proxy__AuditLogPath=/var/log/tailsqlproxy/earth/audit-.log
 Proxy__AuditJsonLogPath=/var/log/tailsqlproxy/earth/audit-json-.log
 Metrics__Port=9092
@@ -234,7 +234,7 @@ EOF
 # Uranus
 sudo tee /etc/tailsqlproxy/uranus.env << 'EOF'
 Proxy__ListenAddress=10.0.1.13
-TargetServer__Host=xilnex-uranus.database.windows.net
+TargetServer__Host=example-uranus.database.windows.net
 Proxy__AuditLogPath=/var/log/tailsqlproxy/uranus/audit-.log
 Proxy__AuditJsonLogPath=/var/log/tailsqlproxy/uranus/audit-json-.log
 Metrics__Port=9093
@@ -243,7 +243,7 @@ EOF
 # Mbntu1
 sudo tee /etc/tailsqlproxy/mbntu1.env << 'EOF'
 Proxy__ListenAddress=10.0.1.14
-TargetServer__Host=xilnex-mbntu1.database.windows.net
+TargetServer__Host=example-mbntu1.database.windows.net
 Proxy__AuditLogPath=/var/log/tailsqlproxy/mbntu1/audit-.log
 Proxy__AuditJsonLogPath=/var/log/tailsqlproxy/mbntu1/audit-json-.log
 Metrics__Port=9094
@@ -339,11 +339,11 @@ Add each Elastic IP to the corresponding Azure SQL Server's firewall:
 
    | Azure SQL Server | Firewall rule IP |
    |------------------|------------------|
-   | xilnex-mercury | EIP-1 |
-   | xilnex-venus | EIP-2 |
-   | xilnex-earth | EIP-3 |
-   | xilnex-uranus | EIP-4 |
-   | xilnex-mbntu1 | EIP-5 |
+   | example-mercury | EIP-1 |
+   | example-venus | EIP-2 |
+   | example-earth | EIP-3 |
+   | example-uranus | EIP-4 |
+   | example-mbntu1 | EIP-5 |
 
    **Note:** Since the EC2 instance is outside Azure, Azure SQL uses **Proxy connection policy** automatically — no routing redirect issues.
 
@@ -366,7 +366,7 @@ sudo journalctl -u tailsqlproxy@mercury --no-pager -n 10
 
 # Test connectivity from your machine
 # (after DNS propagation)
-sqlcmd -S db.mercury.xilnex.com -U webbytes -P 'password' -Q "SELECT 1"
+sqlcmd -S db.mercury.example.com -U <user> -P '<password>' -Q "SELECT 1"
 ```
 
 ---

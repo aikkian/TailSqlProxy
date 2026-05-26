@@ -7,11 +7,11 @@ Deploy 5 proxy instances on a single EC2 instance, each with its own Elastic IP,
 ```
 DNS                    Elastic IP          Private IP       Target Azure SQL
 ─────────────────────  ──────────────────  ──────────────   ──────────────────────────────────
-db.mercury.example.com  → EIP-1 (x.x.x.1)  → 10.0.1.10    → example-mercury.database.windows.net
-db.venus.example.com    → EIP-2 (x.x.x.2)  → 10.0.1.11    → example-venus.database.windows.net
-db.earth.example.com    → EIP-3 (x.x.x.3)  → 10.0.1.12    → example-earth.database.windows.net
-db.uranus.example.com   → EIP-4 (x.x.x.4)  → 10.0.1.13    → example-uranus.database.windows.net
-db.mbntu1.example.com   → EIP-5 (x.x.x.5)  → 10.0.1.14    → example-mbntu1.database.windows.net
+db.db01.example.com  → EIP-1 (x.x.x.1)  → 10.0.1.10    → example-db01.database.windows.net
+db.db02.example.com    → EIP-2 (x.x.x.2)  → 10.0.1.11    → example-db02.database.windows.net
+db.db03.example.com    → EIP-3 (x.x.x.3)  → 10.0.1.12    → example-db03.database.windows.net
+db.db04.example.com   → EIP-4 (x.x.x.4)  → 10.0.1.13    → example-db04.database.windows.net
+db.db05.example.com   → EIP-5 (x.x.x.5)  → 10.0.1.14    → example-db05.database.windows.net
 ```
 
 All 5 instances listen on port 1433, each bound to its own private IP.
@@ -102,7 +102,7 @@ All 5 instances listen on port 1433, each bound to its own private IP.
 ## Step 5: Allocate and Associate Elastic IPs
 
 1. **AWS Console → EC2 → Elastic IPs → Allocate Elastic IP address** (repeat 5 times)
-   - Tag each: `mercury`, `venus`, `earth`, `uranus`, `mbntu1`
+   - Tag each: `db01`, `db02`, `db03`, `db04`, `db05`
 
 2. **Associate each EIP with a private IP:**
    - Select EIP → **Actions → Associate Elastic IP address**
@@ -115,11 +115,11 @@ All 5 instances listen on port 1433, each bound to its own private IP.
 
    | Instance | Private IP | Elastic IP | Target Azure SQL |
    |----------|-----------|------------|------------------|
-   | mercury  | 10.0.1.10 | EIP-1      | example-mercury.database.windows.net |
-   | venus    | 10.0.1.11 | EIP-2      | example-venus.database.windows.net |
-   | earth    | 10.0.1.12 | EIP-3      | example-earth.database.windows.net |
-   | uranus   | 10.0.1.13 | EIP-4      | example-uranus.database.windows.net |
-   | mbntu1   | 10.0.1.14 | EIP-5      | example-mbntu1.database.windows.net |
+   | db01  | 10.0.1.10 | EIP-1      | example-db01.database.windows.net |
+   | db02    | 10.0.1.11 | EIP-2      | example-db02.database.windows.net |
+   | db03    | 10.0.1.12 | EIP-3      | example-db03.database.windows.net |
+   | db04   | 10.0.1.13 | EIP-4      | example-db04.database.windows.net |
+   | db05   | 10.0.1.14 | EIP-5      | example-db05.database.windows.net |
 
 ---
 
@@ -176,7 +176,7 @@ sudo useradd --system --shell /usr/sbin/nologin tdsproxy
 
 # Create proxy directory
 sudo mkdir -p /opt/tailsqlproxy
-sudo mkdir -p /var/log/tailsqlproxy/{mercury,venus,earth,uranus,mbntu1}
+sudo mkdir -p /var/log/tailsqlproxy/{db01,db02,db03,db04,db05}
 sudo chown -R tdsproxy:tdsproxy /opt/tailsqlproxy /var/log/tailsqlproxy
 ```
 
@@ -204,48 +204,48 @@ The `appsettings.json` in `/opt/tailsqlproxy/` is the shared base. Instance-spec
 ### Create environment files for each instance
 
 ```bash
-# Mercury
-sudo tee /etc/tailsqlproxy/mercury.env << 'EOF'
+# db01
+sudo tee /etc/tailsqlproxy/db01.env << 'EOF'
 Proxy__ListenAddress=10.0.1.10
-TargetServer__Host=example-mercury.database.windows.net
-Proxy__AuditLogPath=/var/log/tailsqlproxy/mercury/audit-.log
-Proxy__AuditJsonLogPath=/var/log/tailsqlproxy/mercury/audit-json-.log
+TargetServer__Host=example-db01.database.windows.net
+Proxy__AuditLogPath=/var/log/tailsqlproxy/db01/audit-.log
+Proxy__AuditJsonLogPath=/var/log/tailsqlproxy/db01/audit-json-.log
 Metrics__Port=9090
 EOF
 
-# Venus
-sudo tee /etc/tailsqlproxy/venus.env << 'EOF'
+# db02
+sudo tee /etc/tailsqlproxy/db02.env << 'EOF'
 Proxy__ListenAddress=10.0.1.11
-TargetServer__Host=example-venus.database.windows.net
-Proxy__AuditLogPath=/var/log/tailsqlproxy/venus/audit-.log
-Proxy__AuditJsonLogPath=/var/log/tailsqlproxy/venus/audit-json-.log
+TargetServer__Host=example-db02.database.windows.net
+Proxy__AuditLogPath=/var/log/tailsqlproxy/db02/audit-.log
+Proxy__AuditJsonLogPath=/var/log/tailsqlproxy/db02/audit-json-.log
 Metrics__Port=9091
 EOF
 
-# Earth
-sudo tee /etc/tailsqlproxy/earth.env << 'EOF'
+# db03
+sudo tee /etc/tailsqlproxy/db03.env << 'EOF'
 Proxy__ListenAddress=10.0.1.12
-TargetServer__Host=example-earth.database.windows.net
-Proxy__AuditLogPath=/var/log/tailsqlproxy/earth/audit-.log
-Proxy__AuditJsonLogPath=/var/log/tailsqlproxy/earth/audit-json-.log
+TargetServer__Host=example-db03.database.windows.net
+Proxy__AuditLogPath=/var/log/tailsqlproxy/db03/audit-.log
+Proxy__AuditJsonLogPath=/var/log/tailsqlproxy/db03/audit-json-.log
 Metrics__Port=9092
 EOF
 
-# Uranus
-sudo tee /etc/tailsqlproxy/uranus.env << 'EOF'
+# db04
+sudo tee /etc/tailsqlproxy/db04.env << 'EOF'
 Proxy__ListenAddress=10.0.1.13
-TargetServer__Host=example-uranus.database.windows.net
-Proxy__AuditLogPath=/var/log/tailsqlproxy/uranus/audit-.log
-Proxy__AuditJsonLogPath=/var/log/tailsqlproxy/uranus/audit-json-.log
+TargetServer__Host=example-db04.database.windows.net
+Proxy__AuditLogPath=/var/log/tailsqlproxy/db04/audit-.log
+Proxy__AuditJsonLogPath=/var/log/tailsqlproxy/db04/audit-json-.log
 Metrics__Port=9093
 EOF
 
-# Mbntu1
-sudo tee /etc/tailsqlproxy/mbntu1.env << 'EOF'
+# db05
+sudo tee /etc/tailsqlproxy/db05.env << 'EOF'
 Proxy__ListenAddress=10.0.1.14
-TargetServer__Host=example-mbntu1.database.windows.net
-Proxy__AuditLogPath=/var/log/tailsqlproxy/mbntu1/audit-.log
-Proxy__AuditJsonLogPath=/var/log/tailsqlproxy/mbntu1/audit-json-.log
+TargetServer__Host=example-db05.database.windows.net
+Proxy__AuditLogPath=/var/log/tailsqlproxy/db05/audit-.log
+Proxy__AuditJsonLogPath=/var/log/tailsqlproxy/db05/audit-json-.log
 Metrics__Port=9094
 EOF
 
@@ -296,18 +296,18 @@ sudo systemctl daemon-reload
 
 ```bash
 # Start all instances
-sudo systemctl start tailsqlproxy@mercury
-sudo systemctl start tailsqlproxy@venus
-sudo systemctl start tailsqlproxy@earth
-sudo systemctl start tailsqlproxy@uranus
-sudo systemctl start tailsqlproxy@mbntu1
+sudo systemctl start tailsqlproxy@db01
+sudo systemctl start tailsqlproxy@db02
+sudo systemctl start tailsqlproxy@db03
+sudo systemctl start tailsqlproxy@db04
+sudo systemctl start tailsqlproxy@db05
 
 # Enable auto-start on boot
-sudo systemctl enable tailsqlproxy@mercury
-sudo systemctl enable tailsqlproxy@venus
-sudo systemctl enable tailsqlproxy@earth
-sudo systemctl enable tailsqlproxy@uranus
-sudo systemctl enable tailsqlproxy@mbntu1
+sudo systemctl enable tailsqlproxy@db01
+sudo systemctl enable tailsqlproxy@db02
+sudo systemctl enable tailsqlproxy@db03
+sudo systemctl enable tailsqlproxy@db04
+sudo systemctl enable tailsqlproxy@db05
 
 # Verify all listening
 sudo ss -tlnp | grep 1433
@@ -322,11 +322,11 @@ Update your DNS zone (e.g., Cloudflare, Route53) to point to the new Elastic IPs
 
 | Name | Type | TTL | Value |
 |------|------|-----|-------|
-| db.mercury | A | 3600 | EIP-1 |
-| db.venus | A | 3600 | EIP-2 |
-| db.earth | A | 3600 | EIP-3 |
-| db.uranus | A | 3600 | EIP-4 |
-| db.mbntu1 | A | 3600 | EIP-5 |
+| db.db01 | A | 3600 | EIP-1 |
+| db.db02 | A | 3600 | EIP-2 |
+| db.db03 | A | 3600 | EIP-3 |
+| db.db04 | A | 3600 | EIP-4 |
+| db.db05 | A | 3600 | EIP-5 |
 
 ---
 
@@ -339,11 +339,11 @@ Add each Elastic IP to the corresponding Azure SQL Server's firewall:
 
    | Azure SQL Server | Firewall rule IP |
    |------------------|------------------|
-   | example-mercury | EIP-1 |
-   | example-venus | EIP-2 |
-   | example-earth | EIP-3 |
-   | example-uranus | EIP-4 |
-   | example-mbntu1 | EIP-5 |
+   | example-db01 | EIP-1 |
+   | example-db02 | EIP-2 |
+   | example-db03 | EIP-3 |
+   | example-db04 | EIP-4 |
+   | example-db05 | EIP-5 |
 
    **Note:** Since the EC2 instance is outside Azure, Azure SQL uses **Proxy connection policy** automatically — no routing redirect issues.
 
@@ -353,7 +353,7 @@ Add each Elastic IP to the corresponding Azure SQL Server's firewall:
 
 ```bash
 # Check all instances are running
-for inst in mercury venus earth uranus mbntu1; do
+for inst in db01 db02 db03 db04 db05; do
   echo "=== $inst ==="
   systemctl is-active tailsqlproxy@$inst
 done
@@ -362,11 +362,11 @@ done
 sudo ss -tlnp | grep 1433
 
 # Check logs
-sudo journalctl -u tailsqlproxy@mercury --no-pager -n 10
+sudo journalctl -u tailsqlproxy@db01 --no-pager -n 10
 
 # Test connectivity from your machine
 # (after DNS propagation)
-sqlcmd -S db.mercury.example.com -U <user> -P '<password>' -Q "SELECT 1"
+sqlcmd -S db.db01.example.com -U <user> -P '<password>' -Q "SELECT 1"
 ```
 
 ---
@@ -379,11 +379,11 @@ dotnet publish src/TailSqlProxy -c Release -r linux-arm64 --self-contained true 
 scp -i your-key.pem ./publish/TailSqlProxy.dll ubuntu@<EIP>:/tmp/
 
 # On the EC2 instance:
-sudo systemctl stop tailsqlproxy@mercury tailsqlproxy@venus tailsqlproxy@earth tailsqlproxy@uranus tailsqlproxy@mbntu1
+sudo systemctl stop tailsqlproxy@db01 tailsqlproxy@db02 tailsqlproxy@db03 tailsqlproxy@db04 tailsqlproxy@db05
 sudo cp /tmp/TailSqlProxy.dll /opt/tailsqlproxy/
 sudo chown tdsproxy:tdsproxy /opt/tailsqlproxy/TailSqlProxy.dll
 sudo setcap cap_net_bind_service=+ep /opt/tailsqlproxy/TailSqlProxy
-sudo systemctl start tailsqlproxy@mercury tailsqlproxy@venus tailsqlproxy@earth tailsqlproxy@uranus tailsqlproxy@mbntu1
+sudo systemctl start tailsqlproxy@db01 tailsqlproxy@db02 tailsqlproxy@db03 tailsqlproxy@db04 tailsqlproxy@db05
 ```
 
 ---

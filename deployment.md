@@ -96,7 +96,7 @@ Write `/opt/tailsqlproxy/appsettings.Production.json` on the VM:
     "AllowedClientIps": []
   },
   "TargetServer": {
-    "Host": "example-mercury.database.windows.net",
+    "Host": "example-db01.database.windows.net",
     "Port": 1433
   },
   "ReadWriteSplit": {
@@ -265,13 +265,13 @@ Routes multiple Azure SQL upstreams through :1433 by running one proxy instance 
 
 ```
 Client
-   ↓ mercury.sql.<your-domain>,1433  →  <pip-1>
+   ↓ db01.sql.<your-domain>,1433  →  <pip-1>
 Azure VM NIC (5 IP configurations on one NIC)
-   ├─ 172.21.0.4  ↔  <pip-1>  →  tailsqlproxy@mercury  →  example-mercury.database.windows.net
-   ├─ 172.21.0.5  ↔  <pip-2>  →  tailsqlproxy@venus    →  example-venus.database.windows.net
-   ├─ 172.21.0.6  ↔  <pip-3>  →  tailsqlproxy@earth    →  example-earth.database.windows.net
-   ├─ 172.21.0.7  ↔  <pip-4>  →  tailsqlproxy@mars     →  example-mars.database.windows.net
-   └─ 172.21.0.8  ↔  <pip-5>  →  tailsqlproxy@jupiter  →  example-jupiter.database.windows.net
+   ├─ 172.21.0.4  ↔  <pip-1>  →  tailsqlproxy@db01  →  example-db01.database.windows.net
+   ├─ 172.21.0.5  ↔  <pip-2>  →  tailsqlproxy@db02    →  example-db02.database.windows.net
+   ├─ 172.21.0.6  ↔  <pip-3>  →  tailsqlproxy@db03    →  example-db03.database.windows.net
+   ├─ 172.21.0.7  ↔  <pip-4>  →  tailsqlproxy@db04     →  example-db04.database.windows.net
+   └─ 172.21.0.8  ↔  <pip-5>  →  tailsqlproxy@db05  →  example-db05.database.windows.net
 ```
 
 All 5 instances share `/opt/tailsqlproxy/` (one binary). Per-instance overrides come from `/etc/tailsqlproxy/<instance>.env`. Each instance writes to its own `/var/log/tailsqlproxy/<instance>/` and exposes a unique metrics port.
@@ -333,20 +333,20 @@ sudo systemctl disable tailsqlproxy.service
 
 Create one env file per instance in `/etc/tailsqlproxy/<instance>.env`. .NET reads these as config overrides (`Section__Key` naming maps to `Section:Key` in `appsettings.json`).
 
-Example (`/etc/tailsqlproxy/mercury.env`):
+Example (`/etc/tailsqlproxy/db01.env`):
 
 ```
 Proxy__ListenAddress=172.21.0.4
-TargetServer__Host=example-mercury.database.windows.net
-Proxy__AuditLogPath=/var/log/tailsqlproxy/mercury/audit-.log
-Proxy__AuditJsonLogPath=/var/log/tailsqlproxy/mercury/audit-json-.log
+TargetServer__Host=example-db01.database.windows.net
+Proxy__AuditLogPath=/var/log/tailsqlproxy/db01/audit-.log
+Proxy__AuditJsonLogPath=/var/log/tailsqlproxy/db01/audit-json-.log
 Metrics__Port=9090
 ```
 
 Repeat for each instance, bumping `ListenAddress` / `TargetServer__Host` / `Metrics__Port`. Per-instance log dirs must exist and be owned by `tdsproxy`:
 
 ```bash
-for inst in mercury venus earth mars jupiter; do
+for inst in db01 db02 db03 db04 db05; do
   sudo install -d -o tdsproxy -g tdsproxy -m 750 /var/log/tailsqlproxy/$inst
 done
 sudo chmod 640 /etc/tailsqlproxy/*.env
@@ -395,7 +395,7 @@ Reload and start all instances:
 
 ```bash
 sudo systemctl daemon-reload
-for inst in mercury venus earth mars jupiter; do
+for inst in db01 db02 db03 db04 db05; do
   sudo systemctl enable --now tailsqlproxy@$inst.service
 done
 ```
@@ -404,7 +404,7 @@ done
 
 ```bash
 # all 5 active?
-for inst in mercury venus earth mars jupiter; do
+for inst in db01 db02 db03 db04 db05; do
   printf "%-10s : " "$inst"
   systemctl is-active tailsqlproxy@$inst.service
 done
@@ -419,18 +419,18 @@ sudo ss -tlnp | grep -E ':909[0-9]'
 sqlcmd -S tcp:<pip-1>,1433 -U <user> -P '<pw>' -C -N true -Q "SELECT @@SERVERNAME"
 ```
 
-Expected: `@@SERVERNAME` returns the upstream of that specific instance (e.g. hitting `<pip-1>` returns `example-mercury`'s name; `<pip-2>` returns `example-venus`'s; etc.).
+Expected: `@@SERVERNAME` returns the upstream of that specific instance (e.g. hitting `<pip-1>` returns `example-db01`'s name; `<pip-2>` returns `example-db02`'s; etc.).
 
 ### 11.7 DNS
 
 Create A records (in whatever DNS you control for `<your-domain>`):
 
 ```
-mercury.sql.<your-domain>  → <pip-1>
-venus.sql.<your-domain>    → <pip-2>
-earth.sql.<your-domain>    → <pip-3>
-mars.sql.<your-domain>     → <pip-4>
-jupiter.sql.<your-domain>  → <pip-5>
+db01.sql.<your-domain>  → <pip-1>
+db02.sql.<your-domain>    → <pip-2>
+db03.sql.<your-domain>    → <pip-3>
+db04.sql.<your-domain>     → <pip-4>
+db05.sql.<your-domain>  → <pip-5>
 ```
 
 TTL 300s is fine. Clients then connect via the subdomain rather than raw IP.
@@ -450,12 +450,12 @@ Fix by either:
 ### 11.9 Client connection strings
 
 ```
-jdbc:sqlserver://mercury.sql.<your-domain>:1433;encrypt=true;trustServerCertificate=true;database=<db>
-jdbc:sqlserver://venus.sql.<your-domain>:1433;encrypt=true;trustServerCertificate=true;database=<db>
+jdbc:sqlserver://db01.sql.<your-domain>:1433;encrypt=true;trustServerCertificate=true;database=<db>
+jdbc:sqlserver://db02.sql.<your-domain>:1433;encrypt=true;trustServerCertificate=true;database=<db>
 ```
 
 ```bash
-sqlcmd -S tcp:mercury.sql.<your-domain>,1433 -U <user> -P '<pw>' -C -N true
+sqlcmd -S tcp:db01.sql.<your-domain>,1433 -U <user> -P '<pw>' -C -N true
 ```
 
 ### 11.10 Updating (replace the binary across all instances)
@@ -467,13 +467,13 @@ tar -czf /tmp/tailsqlproxy.tar.gz -C publish .
 scp -i ~/Downloads/tailsqlproxy_key.pem /tmp/tailsqlproxy.tar.gz tailsqlproxy@<VM_IP>:/tmp/
 
 # VM
-for inst in mercury venus earth mars jupiter; do
+for inst in db01 db02 db03 db04 db05; do
   sudo systemctl stop tailsqlproxy@$inst.service
 done
 sudo tar -xzf /tmp/tailsqlproxy.tar.gz -C /opt/tailsqlproxy
 sudo chown -R tdsproxy:tdsproxy /opt/tailsqlproxy
 sudo setcap 'cap_net_bind_service=+ep' /opt/tailsqlproxy/TailSqlProxy
-for inst in mercury venus earth mars jupiter; do
+for inst in db01 db02 db03 db04 db05; do
   sudo systemctl start tailsqlproxy@$inst.service
 done
 ```

@@ -18,6 +18,9 @@ public class TdsProxyServer
     private int _activeConnections;
     private readonly HashSet<string> _allowedClientIps;
 
+    public int ActiveConnections => Volatile.Read(ref _activeConnections);
+    public int MaxConcurrentConnections => _options.MaxConcurrentConnections;
+
     public TdsProxyServer(
         IOptions<ProxyOptions> options,
         IServiceProvider serviceProvider,

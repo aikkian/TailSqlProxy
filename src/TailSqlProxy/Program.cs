@@ -20,7 +20,13 @@ builder.Services.AddSerilog(config =>
 {
     config
         .ReadFrom.Configuration(builder.Configuration)
-        .WriteTo.Console(outputTemplate: "{Timestamp:HH:mm:ss.fff} [{Level:u3}] {Message:lj}{NewLine}{Exception}");
+        // Async wrapper so a slow/stalled stdout pipe (e.g. systemd-journald hiccup)
+        // can't block the calling thread. blockWhenFull:false → drop on overflow
+        // rather than re-introducing the deadlock this wrapper exists to prevent.
+        .WriteTo.Async(a => a.Console(
+            outputTemplate: "{Timestamp:HH:mm:ss.fff} [{Level:u3}] {Message:lj}{NewLine}{Exception}"),
+            bufferSize: 10_000,
+            blockWhenFull: false);
 
     // Conditionally add Datadog sink for application-level logs
     var ddSection = builder.Configuration.GetSection("Proxy:Datadog");
@@ -83,6 +89,10 @@ else
 
 // Hosted service
 builder.Services.AddHostedService<ProxyHostedService>();
+
+// Accept-queue watchdog: exit if the kernel accept queue stays full,
+// so systemd can restart us instead of staying wedged.
+builder.Services.AddHostedService<AcceptQueueWatchdog>();
 
 var host = builder.Build();
 await host.RunAsync();

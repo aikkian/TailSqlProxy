@@ -59,7 +59,10 @@ public class SqlInjectionRule : IQueryRule
         (@"(?i)\bpg_sleep\s*\(", "Time-based injection: pg_sleep()"),
 
         // Stacked query injection — dangerous commands after semicolons
-        (@"(?i);\s*DROP\s+(TABLE|DATABASE|INDEX|VIEW|PROCEDURE|FUNCTION)\b", "Stacked injection: DROP"),
+        // For DROP TABLE specifically, allow a leading '#' or '[' so that temp tables
+        // (#tmp, ##shared, [#tmp]) pass through. The AST visitor does the precise check;
+        // here we just avoid blocking legitimate procedural SQL at the regex stage.
+        (@"(?i);\s*DROP\s+(TABLE\s+(?![#\[])|DATABASE|INDEX|VIEW|PROCEDURE|FUNCTION)\b", "Stacked injection: DROP"),
         (@"(?i);\s*ALTER\s+(TABLE|DATABASE|LOGIN|ROLE|USER)\b", "Stacked injection: ALTER"),
         (@"(?i);\s*CREATE\s+(LOGIN|USER)\b", "Stacked injection: CREATE LOGIN/USER"),
         (@"(?i);\s*EXEC(UTE)?\s+xp_", "Stacked injection: EXEC xp_"),
@@ -252,9 +255,18 @@ public class SqlInjectionRule : IQueryRule
             // Check for stacked dangerous statements
             foreach (var stmt in node.Statements)
             {
-                if (stmt is DropTableStatement or DropDatabaseStatement
-                    or DropProcedureStatement or DropFunctionStatement
-                    or DropViewStatement or DropIndexStatement)
+                if (stmt is DropTableStatement dropTable)
+                {
+                    // Allow DROP TABLE in stacked batches when it only targets local (#x)
+                    // or global (##x) temp tables. Session-scoped temp tables are common in
+                    // normal procedural T-SQL (e.g. SSMS Object Explorer / Copilot metadata
+                    // queries that CREATE #tmp ... SELECT ... DROP #tmp) and pose no
+                    // injection risk.
+                    if (!DropsOnlyTempTables(dropTable))
+                        _hasDropOrAlter = true;
+                }
+                else if (stmt is DropDatabaseStatement or DropProcedureStatement
+                         or DropFunctionStatement or DropViewStatement or DropIndexStatement)
                 {
                     _hasDropOrAlter = true;
                 }
@@ -354,6 +366,20 @@ public class SqlInjectionRule : IQueryRule
                     Reason = "UNION SELECT with all literal/NULL columns (injection probe)";
                 }
             }
+        }
+
+        private static bool DropsOnlyTempTables(DropTableStatement stmt)
+        {
+            if (stmt.Objects is null || stmt.Objects.Count == 0)
+                return false;
+
+            foreach (var obj in stmt.Objects)
+            {
+                var name = obj?.BaseIdentifier?.Value;
+                if (string.IsNullOrEmpty(name) || name[0] != '#')
+                    return false;
+            }
+            return true;
         }
 
         private static bool IsLiteral(ScalarExpression expr) =>

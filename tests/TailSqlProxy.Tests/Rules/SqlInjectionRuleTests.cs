@@ -116,6 +116,51 @@ public class SqlInjectionRuleTests
         _rule.Evaluate(Ctx(sql)).IsBlocked.Should().BeTrue();
     }
 
+    // =============================================
+    // SHOULD BE ALLOWED — DROP TABLE on temp tables in stacked batches
+    // (common in procedural T-SQL, e.g. SSMS Object Explorer metadata queries)
+    // =============================================
+
+    [Theory]
+    [InlineData("CREATE TABLE #tmp (id int); SELECT * FROM #tmp; DROP TABLE #tmp")]
+    [InlineData("CREATE TABLE ##shared (id int); SELECT * FROM ##shared; DROP TABLE ##shared")]
+    [InlineData("SELECT 1; DROP TABLE #t1, #t2")]
+    [InlineData("DECLARE @x INT = 1; SELECT @x; DROP TABLE #temp")]
+    public void Allows_StackedQuery_Drop_TempTablesOnly(string sql)
+    {
+        _rule.Evaluate(Ctx(sql)).IsBlocked.Should().BeFalse(
+            "DROP TABLE on local (#) or global (##) temp tables is session-scoped and safe");
+    }
+
+    [Theory]
+    [InlineData("SELECT 1; DROP TABLE #tmp, RealTable")]
+    [InlineData("SELECT 1; DROP TABLE RealTable, #tmp")]
+    public void Blocks_StackedQuery_Drop_MixedTempAndReal(string sql)
+    {
+        // If any non-temp table is in the drop list, treat the batch as suspicious.
+        _rule.Evaluate(Ctx(sql)).IsBlocked.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Allows_SsmsCopilotMetadataQuery_WithDropTempTable()
+    {
+        // Real query observed from SSMS "Copilot Completions" in production:
+        // creates a temp table, populates it, joins against sys.databases,
+        // then drops the temp table. Was being blocked as "stacked destructive".
+        var sql = @"
+            create table #dso (database_id int primary key, engineEdition int)
+            if serverproperty('EngineEdition') = 11
+            BEGIN
+                insert into #dso select database_id, 11 from sys.databases
+            END
+            SELECT dtb.name AS [Name]
+            FROM sys.databases AS dtb
+            LEFT OUTER JOIN #dso dso ON dso.database_id = dtb.database_id
+            drop table #dso";
+
+        _rule.Evaluate(Ctx(sql)).IsBlocked.Should().BeFalse();
+    }
+
     [Fact]
     public void Blocks_StackedQuery_Shutdown()
     {

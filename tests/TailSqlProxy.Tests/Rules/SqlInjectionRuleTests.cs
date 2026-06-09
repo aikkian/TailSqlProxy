@@ -281,9 +281,41 @@ public class SqlInjectionRuleTests
     [Theory]
     [InlineData("SELECT * FROM sysobjects WHERE xtype='U'")]
     [InlineData("SELECT * FROM syscolumns")]
+    [InlineData("SELECT name\nFROM sysobjects\nWHERE xtype='U'")]      // multi-line still caught
+    [InlineData("SELECT * FROM dbo.sysobjects")]                        // qualified name
+    [InlineData("SELECT * FROM master.dbo.SYSCOLUMNS")]                 // upper-case, three-part
     public void Blocks_SchemaProbing(string sql)
     {
         _rule.Evaluate(Ctx(sql)).IsBlocked.Should().BeTrue();
+    }
+
+    [Theory]
+    [InlineData("SELECT 'sysobjects is a legacy view' AS note")]        // string literal, not a table ref
+    [InlineData("SELECT 1 /* avoid sysobjects in new code */")]         // comment
+    [InlineData("SELECT 1 -- syscolumns")]                              // line comment
+    public void Allows_SchemaProbing_Names_InCommentOrString(string sql)
+    {
+        _rule.Evaluate(Ctx(sql)).IsBlocked.Should().BeFalse(
+            "the names appear in a string/comment, not as a table reference");
+    }
+
+    [Fact]
+    public void DoesNotRedos_OnLongInnocentSelect()
+    {
+        // Regression for the pattern-25/26 ReDoS: a long SELECT...FROM... where the
+        // table is NOT sysobjects/syscolumns must evaluate quickly without blocking.
+        // Previously, "SELECT ... FROM ..." with thousands of chars between would
+        // catastrophically backtrack the unbounded `.*` and trip the 100ms timeout.
+        var padding = string.Join(",\n", Enumerable.Range(1, 200).Select(i => $"col{i}"));
+        var sql = $"SELECT\n{padding}\nFROM dbo.Orders WHERE id = 1";
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var result = _rule.Evaluate(Ctx(sql));
+        sw.Stop();
+
+        result.IsBlocked.Should().BeFalse();
+        sw.ElapsedMilliseconds.Should().BeLessThan(100,
+            "AST-based check must not exhibit ReDoS-like behavior on long queries");
     }
 
     // =============================================

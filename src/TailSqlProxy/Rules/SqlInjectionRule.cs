@@ -346,25 +346,49 @@ public class SqlInjectionRule : IQueryRule
             }
         }
 
-        public override void Visit(BooleanComparisonExpression node)
+        public override void Visit(BooleanBinaryExpression node)
         {
             if (HasViolation) return;
 
-            // Detect tautologies: literal = literal (e.g., 1=1, 'a'='a')
-            if (node.ComparisonType == BooleanComparisonType.Equals
-                && IsLiteral(node.FirstExpression)
-                && IsLiteral(node.SecondExpression))
-            {
-                // Check if both sides are the same value (true tautology)
-                var left = GetLiteralValue(node.FirstExpression);
-                var right = GetLiteralValue(node.SecondExpression);
+            // Tautologies (1=1, 'a'='a', etc.) are only an injection signal when they
+            // are the operand of an OR — `WHERE x = 1 OR 1=1` defeats the WHERE clause.
+            // Standalone `WHERE 1=1` is a developer convenience pattern used by query
+            // builders and dynamic SQL, and must not be blocked.
+            if (node.BinaryExpressionType != BooleanBinaryExpressionType.Or)
+                return;
 
-                if (left != null && right != null && string.Equals(left, right, StringComparison.OrdinalIgnoreCase))
-                {
-                    HasViolation = true;
-                    Reason = $"tautology detected: {left}={right}";
-                }
+            if (IsTautology(node.FirstExpression, out var t1))
+            {
+                HasViolation = true;
+                Reason = $"tautology in OR clause: {t1}";
+                return;
             }
+            if (IsTautology(node.SecondExpression, out var t2))
+            {
+                HasViolation = true;
+                Reason = $"tautology in OR clause: {t2}";
+            }
+        }
+
+        private static bool IsTautology(BooleanExpression? expr, out string description)
+        {
+            description = string.Empty;
+            // Unwrap parentheses so `OR (1=1)` is detected the same as `OR 1=1`.
+            while (expr is BooleanParenthesisExpression p) expr = p.Expression;
+
+            if (expr is not BooleanComparisonExpression cmp
+                || cmp.ComparisonType != BooleanComparisonType.Equals
+                || !IsLiteral(cmp.FirstExpression)
+                || !IsLiteral(cmp.SecondExpression))
+                return false;
+
+            var left = GetLiteralValue(cmp.FirstExpression);
+            var right = GetLiteralValue(cmp.SecondExpression);
+            if (left is null || right is null) return false;
+            if (!string.Equals(left, right, StringComparison.OrdinalIgnoreCase)) return false;
+
+            description = $"{left}={right}";
+            return true;
         }
 
         public override void Visit(BinaryQueryExpression node)

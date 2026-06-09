@@ -63,6 +63,61 @@ public class SqlInjectionRuleTests
         _rule.Evaluate(Ctx("SELECT * FROM Users WHERE id = 1 OR true")).IsBlocked.Should().BeTrue();
     }
 
+    [Fact]
+    public void Blocks_TautologyAttack_OrParenthesised()
+    {
+        // OR (1=1) — same injection, just with parens around the tautology.
+        _rule.Evaluate(Ctx("SELECT * FROM Users WHERE id = 1 OR (1=1)")).IsBlocked.Should().BeTrue();
+    }
+
+    // =============================================
+    // SHOULD BE ALLOWED — Standalone "tautology" patterns used by query builders
+    // (`WHERE 1=1` is a developer convenience, not an injection attempt)
+    // =============================================
+
+    [Theory]
+    [InlineData("SELECT * FROM Orders WHERE 1=1")]
+    [InlineData("SELECT * FROM Orders WHERE 1=1 AND status = 'open'")]
+    [InlineData("SELECT * FROM Orders WHERE status = 'open' AND 1=1")]
+    [InlineData("SELECT * FROM Orders WHERE 'a'='a' AND id = 1")]
+    public void Allows_StandaloneTautology_NotInOrClause(string sql)
+    {
+        _rule.Evaluate(Ctx(sql)).IsBlocked.Should().BeFalse(
+            "literal=literal is only an injection signal when ORed with the rest");
+    }
+
+    [Fact]
+    public void Allows_MultiCteReport_EndingWithWhere1Equals1()
+    {
+        // Captures the structural shape of a production report that was being blocked:
+        // multi-statement batch with DECLARE, DROP/CREATE #temp, INSERT, a chain of
+        // WITH-CTEs ending in a final SELECT ... WHERE 1=1. The standalone tautology
+        // is a query-builder convenience, not an injection signal.
+        var sql = @"
+            declare @dateStart date = '2026-01-01';
+            declare @dateEnd date = '2026-01-02'
+
+            drop table if exists #LocationData
+            create table #LocationData ([Store ID] varchar(32), [Store] nvarchar(256))
+            insert into #LocationData select id, name from dbo.locations where id in ('a','b','c')
+
+            ;WITH SalesData AS (
+                SELECT s.id, s.amount FROM dbo.sales s
+                INNER JOIN #LocationData ld ON s.location = ld.[Store ID]
+                WHERE s.date >= @dateStart AND s.date <= @dateEnd
+            ),
+            FinalData AS (
+                SELECT * FROM SalesData
+            )
+            SELECT *
+            FROM FinalData
+            WHERE 1=1";
+
+        var result = _rule.Evaluate(Ctx(sql));
+        result.IsBlocked.Should().BeFalse(
+            "multi-CTE report with WHERE 1=1 should pass. Reason was: " + result.Reason);
+    }
+
     // =============================================
     // SHOULD BE BLOCKED — Time-Based Blind Injection
     // =============================================

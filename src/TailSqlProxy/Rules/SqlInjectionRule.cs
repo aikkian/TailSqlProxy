@@ -85,9 +85,9 @@ public class SqlInjectionRule : IQueryRule
         (@"(?i)\bEXEC\w*\s*\(\s*0x[0-9a-fA-F]{8,}", "Hex encoding attack: EXEC(0x...)"),
         (@"(?i)\+\s*0x[0-9a-fA-F]{8,}", "Hex string concatenation (potential encoded payload)"),
 
-        // Information schema probing (common in automated injection tools)
-        (@"(?i)\bSELECT\b.*\bFROM\b.*\bsysobjects\b", "Schema probing: sysobjects"),
-        (@"(?i)\bSELECT\b.*\bFROM\b.*\bsyscolumns\b", "Schema probing: syscolumns"),
+        // Schema probing (sysobjects, syscolumns) is detected by the AST visitor —
+        // it matches NamedTableReference instead of regex-scanning the SQL text,
+        // which both avoids ReDoS on long queries and skips matches in comments/strings.
         // @@version removed — legitimate query sent by SSMS, DataGrip, and all JDBC/ODBC drivers
         (@"(?i)\buser_name\s*\(\s*\)", "Information probing: user_name()"),
         (@"(?i)\bsystem_user\b", "Information probing: system_user"),
@@ -321,6 +321,28 @@ public class SqlInjectionRule : IQueryRule
             {
                 HasViolation = true;
                 Reason = "WAITFOR DELAY in multi-statement batch (time-based blind injection)";
+            }
+        }
+
+        public override void Visit(NamedTableReference node)
+        {
+            if (HasViolation) return;
+
+            // Schema probing via the legacy system catalog views (sysobjects, syscolumns).
+            // Doing this in the AST visitor instead of a regex avoids ReDoS on long queries
+            // and won't false-positive on the names appearing inside comments or string literals.
+            var baseName = node.SchemaObject?.BaseIdentifier?.Value;
+            if (baseName is null) return;
+
+            if (string.Equals(baseName, "sysobjects", StringComparison.OrdinalIgnoreCase))
+            {
+                HasViolation = true;
+                Reason = "Schema probing: sysobjects";
+            }
+            else if (string.Equals(baseName, "syscolumns", StringComparison.OrdinalIgnoreCase))
+            {
+                HasViolation = true;
+                Reason = "Schema probing: syscolumns";
             }
         }
 

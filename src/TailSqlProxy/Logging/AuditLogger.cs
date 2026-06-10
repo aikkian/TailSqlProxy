@@ -24,20 +24,30 @@ public class AuditLogger : IAuditLogger, IDisposable
         EnsureDirectoryExists(logPath);
         EnsureDirectoryExists(jsonLogPath);
 
+        // Wrap each File sink with Serilog.Sinks.Async so a slow EBS write or fsync stall
+        // can't block the calling thread. Under sustained write bursts the per-sink lock
+        // would otherwise serialize session-handler threads, starve the ThreadPool, and
+        // wedge the accept loop. blockWhenFull:false → drop audit events on overflow rather
+        // than re-introducing the deadlock this wrapper is meant to prevent. Disposal of
+        // _auditLog flushes both buffers on shutdown.
         var loggerConfig = new LoggerConfiguration()
             .MinimumLevel.Information()
-            .WriteTo.File(
+            .WriteTo.Async(a => a.File(
                 path: logPath,
                 rollingInterval: RollingInterval.Day,
-                outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fffZ} [{Level:u3}] {Message:lj}{NewLine}");
+                outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fffZ} [{Level:u3}] {Message:lj}{NewLine}"),
+                bufferSize: 10_000,
+                blockWhenFull: false);
 
         // JSON structured log (for SIEM ingestion)
         if (!string.IsNullOrWhiteSpace(jsonLogPath))
         {
-            loggerConfig = loggerConfig.WriteTo.File(
+            loggerConfig = loggerConfig.WriteTo.Async(a => a.File(
                 formatter: new CompactJsonFormatter(),
                 path: jsonLogPath,
-                rollingInterval: RollingInterval.Day);
+                rollingInterval: RollingInterval.Day),
+                bufferSize: 10_000,
+                blockWhenFull: false);
         }
 
         var dd = proxyOptions.Datadog;

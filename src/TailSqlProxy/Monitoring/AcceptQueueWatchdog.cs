@@ -26,10 +26,14 @@ public sealed class AcceptQueueWatchdog : BackgroundService
     private readonly ProxyOptions _options;
     private readonly ILogger<AcceptQueueWatchdog> _logger;
 
-    // Tunables — conservative defaults so we don't false-positive on bursty traffic.
-    private static readonly TimeSpan CheckInterval = TimeSpan.FromSeconds(30);
+    // Tunables. Detection window = CheckInterval × ConsecutiveStuckChecks.
+    // 15s × 3 = ~45s end-to-end recovery (vs the original 2 min), which is the
+    // practical floor for "definitely wedged, not just a burst". Real wedges
+    // observed in production stabilise at depth 50-70 for many minutes if left
+    // alone, so 45s of sustained ≥50 is a confident signal.
+    private static readonly TimeSpan CheckInterval = TimeSpan.FromSeconds(15);
     private const int StuckThreshold = 50;
-    private const int ConsecutiveStuckChecks = 4; // 4 × 30s = 2 minutes
+    private const int ConsecutiveStuckChecks = 3; // 3 × 15s = ~45 seconds
     private const int ExitCode = 75; // sysexits.h EX_TEMPFAIL — systemd treats as failure
 
     public AcceptQueueWatchdog(

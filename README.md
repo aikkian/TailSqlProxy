@@ -33,6 +33,7 @@ Client (SSMS/App) --> [TLS] --> TailSqlProxy --+--> [TLS] --> Azure SQL Primary 
 - Daily-rolling text + structured JSON (CompactJsonFormatter)
 - Optional Datadog integration
 - Blocked queries logged with rule name and reason
+- Example retention job in `scripts/` (systemd timer + shell script) — see deployment docs
 
 **Monitoring** -- Prometheus metrics on configurable HTTP endpoint
 - Query counters, duration histograms, slow query detection

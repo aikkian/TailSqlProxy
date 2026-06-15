@@ -217,6 +217,39 @@ sudo setcap 'cap_net_bind_service=+ep' /opt/tailsqlproxy/TailSqlProxy
 sudo systemctl start tailsqlproxy
 ```
 
+## 8a. Log retention (optional)
+
+Serilog rolls audit logs daily but never deletes them — `/var/log/tailsqlproxy/` will grow without bound. The repo ships an example retention job under `scripts/` (a shell script plus a systemd service + timer pair) that you can use as-is or adapt.
+
+Retention thresholds are tunable via env vars: `COMPRESS_AFTER_DAYS` (gzip files older than N days) and `DELETE_AFTER_DAYS` (delete files older than N days). Pick values that match your audit/compliance policy.
+
+```bash
+# From the build machine
+scp -i ~/Downloads/tailsqlproxy_key.pem \
+    scripts/tailsqlproxy-log-cleanup.sh \
+    scripts/tailsqlproxy-log-cleanup.service \
+    scripts/tailsqlproxy-log-cleanup.timer \
+    tailsqlproxy@<VM_IP>:/tmp/
+
+# On the VM
+sudo install -m 0755 -o root -g root /tmp/tailsqlproxy-log-cleanup.sh      /usr/local/sbin/
+sudo install -m 0644 -o root -g root /tmp/tailsqlproxy-log-cleanup.service /etc/systemd/system/
+sudo install -m 0644 -o root -g root /tmp/tailsqlproxy-log-cleanup.timer  /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now tailsqlproxy-log-cleanup.timer
+```
+
+Verify:
+
+```bash
+systemctl list-timers tailsqlproxy-log-cleanup.timer
+sudo journalctl -u tailsqlproxy-log-cleanup.service
+```
+
+The shipped timer schedule and thresholds are illustrative — review the unit and script and adjust them to fit your operational requirements.
+
+journald (the Console sink output) is managed separately by `/etc/systemd/journald.conf` (`SystemMaxUse=200M`) if disk pressure becomes a concern.
+
 ## 9. Client configuration
 
 Any SQL client that speaks TDS 7.x or 8.0 works. The proxy presents a self-signed certificate by default, so clients must either trust it or skip validation.

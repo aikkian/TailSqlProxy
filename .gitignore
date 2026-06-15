@@ -419,3 +419,8 @@ FodyWeavers.xsd
 
 # Local backups pulled from production hosts
 prod-backup/
+
+# Self-host operational notes (incident postmortems, internal runbooks)
+INCIDENT-*.md
+FIX-*.md
+*-Architecture.pptx

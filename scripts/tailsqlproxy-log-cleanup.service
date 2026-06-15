@@ -1,0 +1,8 @@
+[Unit]
+Description=Compress and prune TailSqlProxy audit logs
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/tailsqlproxy-log-cleanup.sh
+StandardOutput=journal
+StandardError=journal

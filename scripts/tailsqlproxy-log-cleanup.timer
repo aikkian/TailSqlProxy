@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily TailSqlProxy log cleanup (gzip >7 days, delete >30 days)
+
+[Timer]
+OnCalendar=*-*-* 03:15:00 UTC
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

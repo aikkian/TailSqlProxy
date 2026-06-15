@@ -116,6 +116,7 @@ Hosted     → MetricsHostedService, ProxyHostedService
 - **systemd:** Template unit `tailsqlproxy@.service` with `EnvironmentFile=/etc/tailsqlproxy/%i.env`. Use `Type=exec` (not `Type=notify` — .NET doesn't call `sd_notify` without `UseSystemd()`).
 - **Permissions:** `setcap cap_net_bind_service=+ep` for port 1433 binding without root.
 - **Dependencies:** `libicu` required on Amazon Linux 2023 (`dnf install libicu`).
+- **Log retention:** Serilog rolls daily but never deletes. Example systemd timer + script in `scripts/tailsqlproxy-log-cleanup.{sh,service,timer}` — tunable via `COMPRESS_AFTER_DAYS` / `DELETE_AFTER_DAYS` env vars. Setup steps in deployment-aws.md §14 / deployment.md §8a. Operators choose their own retention policy; defaults in the shipped script are illustrative only.
 
 ## Gotchas
 

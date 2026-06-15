@@ -371,6 +371,41 @@ sqlcmd -S db.db01.example.com -U <user> -P '<password>' -Q "SELECT 1"
 
 ---
 
+## Step 14: Log Retention (optional)
+
+Serilog rolls audit logs daily but never deletes them, so `/var/log/tailsqlproxy/` will grow without bound. The repo ships an example retention job under `scripts/` — a shell script plus a systemd service + timer pair. You can use it as-is or as a template for your own policy.
+
+The example defaults are tunable via env vars: `COMPRESS_AFTER_DAYS` (gzip files older than N days) and `DELETE_AFTER_DAYS` (delete files older than N days). Pick values that match your audit/compliance window.
+
+```bash
+# From the build machine — copy the three files up
+scp -i your-key.pem \
+    scripts/tailsqlproxy-log-cleanup.sh \
+    scripts/tailsqlproxy-log-cleanup.service \
+    scripts/tailsqlproxy-log-cleanup.timer \
+    ec2-user@<EIP>:/tmp/
+
+# On the EC2 instance — install + enable
+sudo install -m 0755 -o root -g root /tmp/tailsqlproxy-log-cleanup.sh      /usr/local/sbin/
+sudo install -m 0644 -o root -g root /tmp/tailsqlproxy-log-cleanup.service /etc/systemd/system/
+sudo install -m 0644 -o root -g root /tmp/tailsqlproxy-log-cleanup.timer  /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now tailsqlproxy-log-cleanup.timer
+```
+
+Verify:
+
+```bash
+systemctl list-timers tailsqlproxy-log-cleanup.timer
+sudo journalctl -u tailsqlproxy-log-cleanup.service
+```
+
+The timer's schedule and retention thresholds are example values — review the unit and script and adjust them to match your operational requirements before deploying.
+
+journald (the Console sink output) is managed separately by `/etc/systemd/journald.conf` (e.g. `SystemMaxUse=200M`) if disk pressure is a concern.
+
+---
+
 ## Updating the Proxy
 
 ```bash

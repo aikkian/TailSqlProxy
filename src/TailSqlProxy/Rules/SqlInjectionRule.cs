@@ -58,11 +58,14 @@ public class SqlInjectionRule : IQueryRule
         (@"(?i)\bSLEEP\s*\(", "Time-based injection: SLEEP()"),
         (@"(?i)\bpg_sleep\s*\(", "Time-based injection: pg_sleep()"),
 
-        // Stacked query injection — dangerous commands after semicolons
-        // For DROP TABLE specifically, allow a leading '#' or '[' so that temp tables
-        // (#tmp, ##shared, [#tmp]) pass through. The AST visitor does the precise check;
-        // here we just avoid blocking legitimate procedural SQL at the regex stage.
-        (@"(?i);\s*DROP\s+(TABLE\s+(?![#\[])|DATABASE|INDEX|VIEW|PROCEDURE|FUNCTION)\b", "Stacked injection: DROP"),
+        // Stacked query injection — dangerous commands after semicolons.
+        // For DROP TABLE, allow temp tables (#tmp, ##shared, [#tmp]) with or without
+        // a preceding "IF EXISTS" clause — common in normal cleanup scripts. The
+        // negative lookahead consumes the optional "IF EXISTS" so it sees the real
+        // target identifier; otherwise it would only check the literal next char
+        // (which would be "I", letting the regex falsely block a temp-table drop).
+        // The AST visitor (DropsOnlyTempTables) does the precise post-parse check.
+        (@"(?i);\s*DROP\s+(?:TABLE\s+(?!(?:IF\s+EXISTS\s+)?[#\[])|DATABASE|INDEX|VIEW|PROCEDURE|FUNCTION)\b", "Stacked injection: DROP"),
         (@"(?i);\s*ALTER\s+(TABLE|DATABASE|LOGIN|ROLE|USER)\b", "Stacked injection: ALTER"),
         (@"(?i);\s*CREATE\s+(LOGIN|USER)\b", "Stacked injection: CREATE LOGIN/USER"),
         (@"(?i);\s*EXEC(UTE)?\s+xp_", "Stacked injection: EXEC xp_"),

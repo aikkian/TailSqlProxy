@@ -216,6 +216,28 @@ public class SqlInjectionRuleTests
         _rule.Evaluate(Ctx(sql)).IsBlocked.Should().BeFalse();
     }
 
+    [Theory]
+    [InlineData("DROP TABLE IF EXISTS #a;\nDROP TABLE IF EXISTS #b;")]
+    [InlineData("DROP TABLE #a; DROP TABLE IF EXISTS #b")]
+    [InlineData("DROP TABLE IF EXISTS [#a];\nDROP TABLE IF EXISTS [#b];")]
+    public void Allows_MultipleDrops_OfTempTables_WithIfExists(string sql)
+    {
+        // Regression: a batch like "DROP TABLE IF EXISTS #a; DROP TABLE IF EXISTS #b"
+        // was blocked because the regex lookahead saw "I" (from IF EXISTS) instead of
+        // the temp-table "#" sigil. Reported in production 2026-06-18 for SSMS users
+        // running cleanup-then-rebuild temp table scripts.
+        _rule.Evaluate(Ctx(sql)).IsBlocked.Should().BeFalse();
+    }
+
+    [Theory]
+    [InlineData("SELECT 1; DROP TABLE IF EXISTS RealTable")]
+    [InlineData("SELECT 1; DROP TABLE IF EXISTS dbo.RealTable")]
+    public void Blocks_StackedDrop_WithIfExists_OnRealTable(string sql)
+    {
+        // The "IF EXISTS" relaxation must still block real-table drops in stacked batches.
+        _rule.Evaluate(Ctx(sql)).IsBlocked.Should().BeTrue();
+    }
+
     [Fact]
     public void Blocks_StackedQuery_Shutdown()
     {

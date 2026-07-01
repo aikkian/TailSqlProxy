@@ -78,8 +78,11 @@ public class ClientSession : IDisposable
 
     // Timeout for the entire handshake phase (peek + PreLogin + TLS + Login7).
     // Prevents bots/scanners that connect but never complete the handshake from
-    // exhausting the thread pool and blocking legitimate connections.
-    private static readonly TimeSpan HandshakeTimeout = TimeSpan.FromSeconds(30);
+    // exhausting the thread pool and blocking legitimate connections. Raised from
+    // 30s to 60s after observing legitimate SSMS clients on flaky corporate networks
+    // (packet loss during TLS ClientHello) timing out at exactly 29.9s. 60s still
+    // caps abandoned handshakes tightly enough to keep the thread pool healthy.
+    private static readonly TimeSpan HandshakeTimeout = TimeSpan.FromSeconds(60);
 
     public ClientSession(
         IOptions<TargetServerOptions> targetOptions,

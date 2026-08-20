@@ -423,6 +423,131 @@ sudo systemctl start tailsqlproxy@db01 tailsqlproxy@db02 tailsqlproxy@db03 tails
 
 ---
 
+## Adding an Additional Instance to an Existing Deployment
+
+Sometimes an instance's env file, log directories, and systemd unit are pre-provisioned (e.g. a secondary private IP already assigned to the ENI) but the instance was left disabled until a new target database was ready. Bringing it online just needs an Elastic IP, DNS, and firewall — no OS/netplan changes.
+
+1. **Confirm the private IP is already on the ENI and unused**
+
+   ```bash
+   ip addr show ens5 | grep inet
+   sudo ss -tlnp | grep 1433   # make sure no other instance is already bound to this IP
+   sudo cat /etc/tailsqlproxy/dbNN.env   # confirm TargetServer__Host / Metrics__Port are set correctly
+   ```
+
+2. **Allocate a new Elastic IP** (AWS Console → EC2 → Elastic IPs → Allocate)
+
+3. **Associate it with the specific private IP — not the instance as a whole**
+
+   In the "Associate Elastic IP address" dialog, choose **Resource type: Network interface** (not "Instance"). Selecting "Instance" targets the primary private IP by default and, per AWS's own warning in that dialog, can disassociate an EIP the instance already has — risky when other instances on the same ENI already have EIPs attached. Select the ENI, then explicitly pick the target private IP (e.g. `10.0.1.15`) under **Private IP address**.
+
+4. **Point DNS at the new EIP**
+   - `db.dbNN.example.com` → A record → new EIP
+
+5. **Whitelist the new EIP on the Azure SQL side**
+   - Azure Portal → SQL Server → Networking → Firewall rules → add the new EIP
+
+6. **Confirm the security group already covers the instance's port(s)**
+   - `1433` and the Prometheus metrics port range (`9090-9094` or wider) should already be covered by the existing `tailsqlproxy-sg` rules — no change needed unless the metrics port falls outside the existing range.
+
+7. **Enable and start the systemd unit**
+
+   ```bash
+   sudo systemctl enable --now tailsqlproxy@dbNN
+   sudo ss -tlnp | grep <private-ip>
+   sudo journalctl -u tailsqlproxy@dbNN --no-pager -n 20
+   ```
+
+8. **Verify end-to-end** (after DNS propagation and firewall rule are live)
+
+   ```bash
+   sqlcmd -S db.dbNN.example.com -U <user> -P '<password>' -Q "SELECT 1"
+   ```
+
+---
+
+## Troubleshooting: Intermittent TLS Handshake Failures / Connection Resets
+
+**Symptom:** SSMS (or another TDS client) intermittently fails to connect with something like:
+
+```
+Connection Timeout Expired. The timeout period elapsed while attempting to consume
+the pre-login handshake acknowledgement... [Pre-Login] initialization=347; handshake=29931
+```
+
+or the proxy logs show repeated `System.IO.IOException` during the TLS handshake:
+
+```
+Session error for client <ip>
+System.IO.IOException: Received an unexpected EOF or 0 bytes from the transport stream.
+   at System.Net.Security.SslStream.ReceiveHandshakeFrameAsync[TIOAdapter](CancellationToken cancellationToken)
+   at TailSqlProxy.Proxy.TlsBridge.EstablishClientTds7TlsAsync(...)
+```
+
+or `System.IO.IOException: Unable to read data from the transport connection: Connection reset by peer.`
+
+### Step 1: Rule out an accept-loop wedge
+
+The proxy ships an `AcceptQueueWatchdog` (see `src/TailSqlProxy/Monitoring/AcceptQueueWatchdog.cs`) that self-restarts an instance if its kernel accept queue stays stuck ≥50 deep for ~45s — a prior incident where a blocking Serilog/journald write starved the .NET thread pool. Check whether this fired around the failure time:
+
+```bash
+sudo journalctl -u tailsqlproxy@dbNN --since "1 day ago" --no-pager | grep -i "appears wedged"
+```
+
+If it fired once and the instance recovered cleanly afterward, that single event explains connections that failed in the ~45s window before the self-restart — not an ongoing problem by itself. If it's firing repeatedly, that points to real thread-pool starvation (CPU/memory pressure, a blocking I/O call somewhere) and needs separate investigation.
+
+### Step 2: Correlate handshake exceptions to client IP
+
+```bash
+for inst in db01 db02 db03 db04 db05; do
+  echo "=== $inst ==="
+  sudo journalctl -u tailsqlproxy@$inst --since "24 hours ago" --no-pager | grep -c "ReceiveHandshakeFrameAsync"
+done
+
+sudo journalctl -u tailsqlproxy@dbNN --since "24 hours ago" --no-pager \
+  | grep -oE 'Session error for client [0-9.]+' | sort | uniq -c | sort -rn
+```
+
+If failures cluster heavily on one client IP (e.g. one office's NAT'd egress) across multiple proxy instances, the proxy itself is unlikely to be the problem — something on that network path (corporate firewall, NAT box, SSL inspection) is dropping or resetting packets. Two most likely causes, in order of how often they explain this:
+
+1. **The client's own connect timeout is too short.** SSMS defaults to a 30s connect timeout; if the TLS handshake takes ≥30s the client gives up regardless of what the proxy does. The proxy's own `HandshakeTimeout` in `ClientSession.cs` was raised from 30s → 60s for exactly this reason — but that only helps if the client is also configured to wait that long (SSMS: Connection Properties → Additional Connection Parameters / Connect Timeout).
+2. **Path MTU mismatch causing silent packet drops during the TLS handshake.** AWS EC2 instances default to a 9001-byte (jumbo frame) MTU on the primary ENI for intra-VPC traffic, but the actual path to a client over the public internet is standard 1500-byte MTU. If PMTU discovery is blackholed somewhere on that path (common on corporate firewalls that drop ICMP "fragmentation needed" messages), oversized packets — like a TLS ClientHello/Certificate exchange — get silently dropped instead of fragmented, producing exactly the reset/EOF/timeout pattern above for specific client networks while others work fine.
+
+### Step 3: Fix the MTU mismatch (if diagnosed as the cause)
+
+```bash
+# 1. Apply immediately (live, reversible, no restart)
+sudo ip link set dev ens5 mtu 1500
+ip -o link show ens5   # confirm: mtu 1500
+
+# 2. Persist across reboots — method depends on the host's network stack:
+
+## Ubuntu (netplan) — e.g. Step 6 of this guide:
+sudo tee /etc/netplan/52-mtu-override.yaml << 'EOF'
+network:
+  version: 2
+  ethernets:
+    ens5:
+      mtu: 1500
+EOF
+sudo netplan apply
+
+## Amazon Linux 2023 (systemd-networkd) — AWS's ec2-net-utils regenerates
+## /run/systemd/network/70-ens5.network fresh on every boot with MTUBytes=9001
+## baked in, so editing that file directly will NOT survive a reboot. Use an
+## /etc drop-in instead, which merges on top of the regenerated file:
+sudo mkdir -p /etc/systemd/network/70-ens5.network.d
+printf '[Link]\nMTUBytes=1500\n' | sudo tee /etc/systemd/network/70-ens5.network.d/10-mtu-override.conf
+sudo networkctl reload
+networkctl status ens5 | grep -i mtu   # confirm: MTU: 1500
+```
+
+**This changes the MTU for the whole host** — since all 5 instances share the same ENI/`ens5` interface, this is not scoped to a single instance. It's fully reversible: remove the override file/drop-in and re-run with `mtu 9001` to restore jumbo frames.
+
+Monitor the affected instance(s) for a day afterward and re-run the Step 2 correlation query — a drop in reset/EOF counts from the previously-affected client IP confirms the diagnosis.
+
+---
+
 ## Cost Estimate (Singapore region, monthly)
 
 | Resource | Cost |

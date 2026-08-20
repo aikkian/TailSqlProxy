@@ -163,13 +163,14 @@ public class ClientSession : IDisposable
                 _logger.LogDebug("Detected TDS 7.x client (PreLogin first)");
 
                 // Relay raw PreLogin in both directions before either side starts TLS.
+                // MARS is forced off along the way — see RewritePreLoginForcingMarsOff.
                 var rawClientReader = new TdsMessageReader(clientNetStream);
                 var clientPreLogin = await rawClientReader.ReadMessageAsync(hct);
                 if (clientPreLogin == null)
                     throw new InvalidOperationException("Client disconnected during PreLogin.");
 
-                foreach (var pkt in clientPreLogin.Packets)
-                    await serverNetStream.WriteAsync(pkt.RawBytes, hct);
+                foreach (var raw in RewritePreLoginForcingMarsOff(clientPreLogin))
+                    await serverNetStream.WriteAsync(raw, hct);
                 await serverNetStream.FlushAsync(hct);
 
                 var rawServerReader = new TdsMessageReader(serverNetStream);
@@ -177,8 +178,8 @@ public class ClientSession : IDisposable
                 if (serverPreLogin == null)
                     throw new InvalidOperationException("Server disconnected during PreLogin.");
 
-                foreach (var pkt in serverPreLogin.Packets)
-                    await clientNetStream.WriteAsync(pkt.RawBytes, hct);
+                foreach (var raw in RewritePreLoginForcingMarsOff(serverPreLogin))
+                    await clientNetStream.WriteAsync(raw, hct);
                 await clientNetStream.FlushAsync(hct);
 
                 _serverStream = await _tlsBridge.EstablishServerTds7TlsAsync(
@@ -201,7 +202,7 @@ public class ClientSession : IDisposable
                     _sessionId, _username, _appName);
             }
 
-            // Bidirectional relay — two concurrent tasks for MARS support
+            // Bidirectional relay — two concurrent tasks, full-duplex TDS
             await RunBidirectionalRelayAsync(ct);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -280,8 +281,9 @@ public class ClientSession : IDisposable
     ///   1. Client→Server: reads client messages, inspects/blocks, forwards allowed ones to server
     ///   2. Server→Client: reads server packets and forwards them to client transparently
     /// When either side disconnects or errors, both tasks are cancelled.
-    /// This supports MARS (Multiple Active Result Sets) where the client can send
-    /// new queries while previous responses are still streaming back.
+    /// This is a full-duplex TDS relay, not SMP session multiplexing — MARS is
+    /// forced off during PreLogin (see RewritePreLoginForcingMarsOff) because the
+    /// proxy doesn't implement the SMP/SMUX layer MARS clients require post-login.
     /// </summary>
     private async Task RunBidirectionalRelayAsync(CancellationToken ct)
     {
@@ -950,16 +952,46 @@ public class ClientSession : IDisposable
             throw new InvalidOperationException("Client disconnected during PreLogin.");
 
         _logger.LogDebug("Received PreLogin from client, forwarding to server");
-        foreach (var packet in clientPreLogin.Packets)
-            await _serverWriter!.WriteRawAsync(packet.RawBytes, ct);
+        foreach (var raw in RewritePreLoginForcingMarsOff(clientPreLogin))
+            await _serverWriter!.WriteRawAsync(raw, ct);
 
         var serverPreLogin = await _serverReader!.ReadMessageAsync(ct);
         if (serverPreLogin == null)
             throw new InvalidOperationException("Server disconnected during PreLogin.");
 
         _logger.LogDebug("Received PreLogin response from server, forwarding to client");
-        foreach (var packet in serverPreLogin.Packets)
-            await _clientWriter!.WriteRawAsync(packet.RawBytes, ct);
+        foreach (var raw in RewritePreLoginForcingMarsOff(serverPreLogin))
+            await _clientWriter!.WriteRawAsync(raw, ct);
+    }
+
+    /// <summary>
+    /// Forces the MARS PreLogin option off before relaying. The proxy relays raw TDS
+    /// packets and has no SMP/SMUX session-multiplexing layer, so a client that
+    /// negotiates MARS=on wraps its post-login traffic in an SMP header the proxy
+    /// misreads as a corrupt TDS packet header (typically surfacing as
+    /// "Invalid TDS packet length: 0"). Rewriting both directions — not just the
+    /// server's response — keeps the backend leg clean too.
+    /// </summary>
+    internal static IEnumerable<byte[]> RewritePreLoginForcingMarsOff(TdsMessage message)
+    {
+        var rewritten = new PreLoginMessage(message).SetMarsOff();
+        if (rewritten.AsSpan().SequenceEqual(message.Payload))
+        {
+            foreach (var pkt in message.Packets)
+                yield return pkt.RawBytes;
+            yield break;
+        }
+
+        int offset = 0;
+        foreach (var pkt in message.Packets)
+        {
+            int len = pkt.Payload.Length;
+            var raw = new byte[TdsPacketHeader.Size + len];
+            Array.Copy(pkt.RawBytes, 0, raw, 0, TdsPacketHeader.Size);
+            Array.Copy(rewritten, offset, raw, TdsPacketHeader.Size, len);
+            offset += len;
+            yield return raw;
+        }
     }
 
     private async Task HandleLogin7Async(CancellationToken ct)

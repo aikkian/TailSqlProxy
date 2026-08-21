@@ -50,7 +50,7 @@ Client (SSMS/DataGrip) → [TLS] → TailSqlProxy ──┬──→ [TLS] → A
 3. **TLS** — TDS 7.x: wrapped in TDS PreLogin packets via `TdsPreLoginWrapperStream` (TLS 1.2 only to avoid post-handshake ticket corruption); TDS 8.0: raw TLS
 4. **Login7** — extract user/db/app, rewrite ServerName to target host (clients send "localhost"), handle FedAuth/Entra ID
 5. **Azure SQL Redirect** — if gateway sends ENVCHANGE Routing token, follow redirect to database node transparently
-6. **Bidirectional Relay** — two concurrent tasks (client→server + server→client), full-duplex raw TDS. MARS is forced off during PreLogin (both directions) since the proxy has no SMP/SMUX layer for it — see "MARS clients" gotcha below.
+6. **Bidirectional Relay** — two concurrent tasks (client→server + server→client) with MARS support
 
 ### Key Design Decisions
 
@@ -127,4 +127,3 @@ Hosted     → MetricsHostedService, ProxyHostedService
 - Prometheus `DurationBuckets` must be strictly ascending — .NET config binding can produce duplicates; `ProxyMetrics` applies `Distinct().OrderBy()` defensively
 - Self-signed cert regenerates on each restart — users see "certificate changed" warnings unless a real cert is loaded via `Proxy.Certificate.Path`
 - `entra-id-user` is a fallback username for FedAuth logins when real UPN extraction isn't available
-- MARS clients (e.g. php-sqlsrv/ODBC, which enable `MultipleActiveResultSets` by default) are transparently forced to plain TDS via a PreLogin rewrite (`PreLoginMessage.SetMarsOff`) — without it they'd wrap post-login traffic in an SMP/SMUX layer the proxy can't parse, surfacing as `Invalid TDS packet length: 0` and a client-side connection reset right after login

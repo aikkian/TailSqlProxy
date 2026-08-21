@@ -43,7 +43,7 @@ Client (SSMS/App) --> [TLS] --> TailSqlProxy --+--> [TLS] --> Azure SQL Primary 
 **Protocol Support**
 - TDS 8.0 (direct TLS) and TDS 7.x (PreLogin-first with wrapped TLS)
 - Entra ID / Azure AD authentication (FedAuth token relay)
-- MARS (Multiple Active Result Sets) is forced off during PreLogin — the proxy relays raw TDS and doesn't implement the SMP/SMUX session-multiplexing layer MARS clients require post-login
+- MARS (Multiple Active Result Sets) via bidirectional relay
 - Login7 server name rewriting for transparent proxying
 
 ## Quick Start

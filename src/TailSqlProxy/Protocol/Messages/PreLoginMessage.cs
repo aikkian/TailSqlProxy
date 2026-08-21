@@ -45,25 +45,7 @@ public class PreLoginMessage
         return null;
     }
 
-    public byte? GetMarsOption()
-    {
-        var tokens = ParseTokens();
-        if (tokens.TryGetValue(PreLoginTokenType.Mars, out var data) && data.Length >= 1)
-            return data[0];
-        return null;
-    }
-
-    public byte[] SetEncryptionOption(EncryptionOption option) =>
-        SetOptionByte(PreLoginTokenType.Encryption, (byte)option);
-
-    // MARS negotiated on (PreLoginTokenType.Mars = 0x04) makes the client wrap all
-    // post-login TDS traffic in an SMP/SMUX session-multiplexing layer the proxy doesn't
-    // implement (it relays raw TDS packets only). Forcing this option to 0x00 in both
-    // PreLogin directions makes every MARS-capable client fall back to plain TDS
-    // transparently, since the client keys its decision on the server's response.
-    public byte[] SetMarsOff() => SetOptionByte(PreLoginTokenType.Mars, 0x00);
-
-    private byte[] SetOptionByte(PreLoginTokenType type, byte value)
+    public byte[] SetEncryptionOption(EncryptionOption option)
     {
         var result = (byte[])_payload.Clone();
         var span = result.AsSpan();
@@ -81,9 +63,9 @@ public class PreLoginMessage
             ushort dataOffset = BinaryPrimitives.ReadUInt16BigEndian(span[(offset + 1)..]);
             ushort dataLength = BinaryPrimitives.ReadUInt16BigEndian(span[(offset + 3)..]);
 
-            if (tokenType == (byte)type && dataLength >= 1)
+            if (tokenType == (byte)PreLoginTokenType.Encryption && dataLength >= 1)
             {
-                result[dataOffset] = value;
+                result[dataOffset] = (byte)option;
             }
 
             offset += 5;
